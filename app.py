@@ -32,6 +32,16 @@ for i in range(1, 7):
     if val:
         lines.append(f"{key_name}={val}")
         nvidia_keys.append(val)
+honcho_key = os.environ.get("HONCHO_API_KEY")
+if honcho_key:
+    lines.append(f"HONCHO_API_KEY={honcho_key}")
+    honcho_dir = Path.home() / ".honcho"
+    honcho_dir.mkdir(parents=True, exist_ok=True)
+    honcho_config = honcho_dir / "config.json"
+    if not honcho_config.exists():
+        import json
+        honcho_config.write_text(json.dumps({"enabled": True}))
+
 dotenv_path.write_text("\n".join(lines) + "\n")
 
 key_cycle = itertools.cycle(nvidia_keys) if nvidia_keys else None
