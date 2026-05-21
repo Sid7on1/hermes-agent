@@ -2,12 +2,22 @@ import os
 import sys
 import subprocess
 import threading
+from pathlib import Path
 
 from flask import Flask
 
 app = Flask(__name__)
 
+hermes_home = Path.home() / ".hermes"
+hermes_home.mkdir(parents=True, exist_ok=True)
+
+config_src = Path(__file__).parent / "config.yaml"
+config_dst = hermes_home / "config.yaml"
+if config_src.exists() and not config_dst.exists():
+    config_dst.write_text(config_src.read_text())
+
 env = os.environ.copy()
+env["HERMES_HOME"] = str(hermes_home)
 
 for i in range(1, 7):
     key_name = f"NVIDIA_NIM_KEY_{i}"

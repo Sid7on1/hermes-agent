@@ -1,0 +1,12 @@
+model:
+  default: minimaxai/minimax-m2.7
+  provider: nvidia
+
+network:
+  force_ipv4: false
+
+security:
+  redact_secrets: true
+
+terminal:
+  backend: local
