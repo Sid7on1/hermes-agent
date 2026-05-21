@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import subprocess
 import threading
@@ -18,6 +19,7 @@ if config_src.exists() and not config_dst.exists():
 
 env = os.environ.copy()
 env["HERMES_HOME"] = str(hermes_home)
+env["GATEWAY_ALLOW_ALL_USERS"] = "true"
 
 for i in range(1, 7):
     key_name = f"NVIDIA_NIM_KEY_{i}"
@@ -42,6 +44,16 @@ def log_output(proc):
 
 
 threading.Thread(target=log_output, args=(proc,), daemon=True).start()
+
+
+def shutdown(signum, frame):
+    proc.terminate()
+    proc.wait(timeout=10)
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
 
 
 @app.route("/")
