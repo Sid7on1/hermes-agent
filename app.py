@@ -18,17 +18,16 @@ if config_src.exists() and not config_dst.exists():
     config_dst.write_text(config_src.read_text())
 
 dotenv_path = hermes_home / ".env"
-if not dotenv_path.exists():
-    lines = ["GATEWAY_ALLOW_ALL_USERS=true"]
-    telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if telegram_token:
-        lines.append(f"TELEGRAM_BOT_TOKEN={telegram_token}")
-    for i in range(1, 7):
-        key_name = f"NVIDIA_NIM_KEY_{i}"
-        val = os.environ.get(key_name)
-        if val:
-            lines.append(f"{key_name}={val}")
-    dotenv_path.write_text("\n".join(lines) + "\n")
+lines = ["GATEWAY_ALLOW_ALL_USERS=true"]
+telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+if telegram_token:
+    lines.append(f"TELEGRAM_BOT_TOKEN={telegram_token}")
+for i in range(1, 7):
+    key_name = f"NVIDIA_NIM_KEY_{i}"
+    val = os.environ.get(key_name)
+    if val:
+        lines.append(f"{key_name}={val}")
+dotenv_path.write_text("\n".join(lines) + "\n")
 
 env = os.environ.copy()
 env["HERMES_HOME"] = str(hermes_home)
