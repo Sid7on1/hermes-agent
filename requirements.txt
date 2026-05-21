@@ -1,0 +1,2 @@
+flask
+git+https://github.com/NousResearch/Hermes-Agent.git
