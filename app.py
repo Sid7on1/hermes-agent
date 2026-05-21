@@ -20,7 +20,7 @@ if config_src.exists() and not config_dst.exists():
     config_dst.write_text(config_src.read_text())
 
 dotenv_path = hermes_home / ".env"
-lines = ["GATEWAY_ALLOW_ALL_USERS=true"]
+lines = []
 telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
 if telegram_token:
     lines.append(f"TELEGRAM_BOT_TOKEN={telegram_token}")
