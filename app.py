@@ -40,26 +40,37 @@ for i in range(1, 7):
 if "NVIDIA_NIM_KEY_1" in env:
     env.setdefault("NVIDIA_API_KEY", env["NVIDIA_NIM_KEY_1"])
 
-proc = subprocess.Popen(
-    ["hermes", "gateway"],
-    env=env,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True,
-)
+hermes_proc = None
 
-
-def log_output(proc):
-    for line in proc.stdout:
+def run_hermes():
+    global hermes_proc
+    # Wait 45 seconds for Render to swap traffic and kill the old container's polling session
+    print("[FLASK] Waiting 45 seconds to avoid Telegram polling conflict from old container...", flush=True)
+    import time
+    time.sleep(45)
+    print("[FLASK] Starting Hermes Gateway...", flush=True)
+    hermes_proc = subprocess.Popen(
+        ["hermes", "gateway"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    for line in hermes_proc.stdout:
         print(f"[HERMES] {line}", end="", flush=True)
 
 
-threading.Thread(target=log_output, args=(proc,), daemon=True).start()
+threading.Thread(target=run_hermes, daemon=True).start()
 
 
 def shutdown(signum, frame):
-    proc.terminate()
-    proc.wait(timeout=10)
+    print("[FLASK] Received shutdown signal...", flush=True)
+    if hermes_proc is not None:
+        hermes_proc.terminate()
+        try:
+            hermes_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            hermes_proc.kill()
     sys.exit(0)
 
 
