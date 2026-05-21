@@ -3,7 +3,9 @@ import signal
 import sys
 import subprocess
 import threading
+import time
 from pathlib import Path
+from io import BytesIO
 
 import itertools
 import requests
@@ -13,6 +15,46 @@ app = Flask(__name__)
 
 hermes_home = Path.home() / ".hermes"
 hermes_home.mkdir(parents=True, exist_ok=True)
+
+# --- Supabase Sync Setup ---
+supabase_url = os.environ.get("SUPABASE_URL")
+supabase_key = os.environ.get("SUPABASE_KEY")
+supabase_client = None
+
+if supabase_url and supabase_key:
+    try:
+        from supabase import create_client, Client
+        supabase_client: Client = create_client(supabase_url, supabase_key)
+        print("[FLASK] Supabase Storage: Connected", flush=True)
+    except Exception as e:
+        print(f"[FLASK] Supabase Storage: Connection failed ({e})", flush=True)
+
+def download_from_supabase(path_str):
+    if not supabase_client: return
+    try:
+        res = supabase_client.storage.from_("hermes-state").download(path_str)
+        local_path = hermes_home / path_str
+        local_path.write_bytes(res)
+        print(f"[FLASK] Supabase Sync: Downloaded {path_str}", flush=True)
+    except Exception as e:
+        print(f"[FLASK] Supabase Sync: Download failed for {path_str} ({e})", flush=True)
+
+def upload_to_supabase(path_str):
+    if not supabase_client: return
+    local_path = hermes_home / path_str
+    if local_path.exists():
+        try:
+            supabase_client.storage.from_("hermes-state").upload(path_str, local_path.read_bytes(), {"upsert": "true"})
+            print(f"[FLASK] Supabase Sync: Uploaded {path_str}", flush=True)
+        except Exception as e:
+            print(f"[FLASK] Supabase Sync: Upload failed for {path_str} ({e})", flush=True)
+
+# Restore state from cloud
+if supabase_client:
+    download_from_supabase("state.db")
+    download_from_supabase("config.yaml")
+    download_from_supabase(".env")
+# --------------------------
 
 config_src = Path(__file__).parent / "config.yaml"
 config_dst = hermes_home / "config.yaml"
@@ -102,6 +144,14 @@ def shutdown(signum, frame):
             hermes_proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             hermes_proc.kill()
+    
+    # Save state to cloud
+    if supabase_client:
+        print("[FLASK] Saving memory to Supabase...", flush=True)
+        upload_to_supabase("state.db")
+        upload_to_supabase("config.yaml")
+        upload_to_supabase(".env")
+    
     sys.exit(0)
 
 
