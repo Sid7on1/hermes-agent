@@ -1,5 +1,7 @@
 import os
+import sys
 import subprocess
+import threading
 
 from flask import Flask
 
@@ -15,12 +17,21 @@ for i in range(1, 7):
 if "NVIDIA_NIM_KEY_1" in env:
     env.setdefault("NVIDIA_API_KEY", env["NVIDIA_NIM_KEY_1"])
 
-subprocess.Popen(
-    ["python", "-m", "hermes.gateway.telegram"],
+proc = subprocess.Popen(
+    ["hermes", "gateway"],
     env=env,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
 )
+
+
+def log_output(proc):
+    for line in proc.stdout:
+        print(f"[HERMES] {line}", end="", flush=True)
+
+
+threading.Thread(target=log_output, args=(proc,), daemon=True).start()
 
 
 @app.route("/")
