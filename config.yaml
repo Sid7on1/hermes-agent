@@ -2,6 +2,17 @@ model:
   default: minimaxai/minimax-m2.7
   provider: nvidia
 
+nvidia:
+  strategy: round_robin
+  keys:
+    - NVIDIA_NIM_KEY_1
+    - NVIDIA_NIM_KEY_2
+    - NVIDIA_NIM_KEY_3
+    - NVIDIA_NIM_KEY_4
+    - NVIDIA_NIM_KEY_5
+    - NVIDIA_NIM_KEY_6
+  rpm: 40
+
 network:
   force_ipv4: false
 

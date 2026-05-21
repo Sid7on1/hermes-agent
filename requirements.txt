@@ -1,2 +1,3 @@
 flask
 git+https://github.com/NousResearch/Hermes-Agent.git#egg=hermes-agent[messaging]
+requests
