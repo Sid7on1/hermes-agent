@@ -38,6 +38,7 @@ key_cycle = itertools.cycle(nvidia_keys) if nvidia_keys else None
 
 env = os.environ.copy()
 env["HERMES_HOME"] = str(hermes_home)
+env["PYTHONUNBUFFERED"] = "1"
 
 for i in range(1, 7):
     key_name = f"NVIDIA_NIM_KEY_{i}"
@@ -67,9 +68,12 @@ def run_hermes():
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
     for line in hermes_proc.stdout:
         print(f"[HERMES] {line}", end="", flush=True)
+    rc = hermes_proc.returncode
+    print(f"[FLASK] Hermes Gateway exited with code {rc}", flush=True)
 
 
 threading.Thread(target=run_hermes, daemon=True).start()
