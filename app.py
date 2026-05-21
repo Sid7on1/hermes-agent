@@ -103,25 +103,32 @@ def proxy(path):
     
     headers = {k: v for k, v in request.headers if k.lower() not in ['host', 'authorization']}
     
-    next_key = next(key_cycle)
-    headers["Authorization"] = f"Bearer {next_key}"
-    print(f"[FLASK-PROXY] Proxying request to {target_url} using round-robin key...", flush=True)
-    
-    resp = requests.request(
-        method=request.method,
-        url=target_url,
-        headers=headers,
-        data=request.get_data(),
-        cookies=request.cookies,
-        allow_redirects=False,
-        stream=True
-    )
-    
     excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-    resp_headers = [(name, value) for (name, value) in resp.raw.headers.items()
-               if name.lower() not in excluded_headers]
-               
-    return Response(resp.iter_content(chunk_size=1024), resp.status_code, resp_headers)
+    
+    max_attempts = len(nvidia_keys)
+    for attempt in range(max_attempts):
+        next_key = next(key_cycle)
+        headers["Authorization"] = f"Bearer {next_key}"
+        print(f"[FLASK-PROXY] Attempt {attempt+1}/{max_attempts} to {target_url} with key...", flush=True)
+        
+        resp = requests.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            data=request.get_data(),
+            cookies=request.cookies,
+            allow_redirects=False,
+            stream=True
+        )
+        
+        if resp.status_code not in (401, 403):
+            resp_headers = [(name, value) for (name, value) in resp.raw.headers.items()
+                       if name.lower() not in excluded_headers]
+            return Response(resp.iter_content(chunk_size=1024), resp.status_code, resp_headers)
+        
+        print(f"[FLASK-PROXY] Key rejected ({resp.status_code}), trying next...", flush=True)
+    
+    return "All NVIDIA keys failed authentication", 503
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=port)
