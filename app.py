@@ -58,6 +58,11 @@ for i in range(1, 7):
 if "NVIDIA_NIM_KEY_1" in env:
     env.setdefault("NVIDIA_API_KEY", env["NVIDIA_NIM_KEY_1"])
 
+if os.environ.get("DATABASE_URL"):
+    print("[FLASK] Supabase Memory: Enabled", flush=True)
+else:
+    print("[FLASK] Supabase Memory: Not configured (add DATABASE_URL to Render)", flush=True)
+
 port = int(os.environ.get("PORT", 8080))
 local_proxy_url = f"http://127.0.0.1:{port}/v1"
 env["NVIDIA_BASE_URL"] = local_proxy_url
