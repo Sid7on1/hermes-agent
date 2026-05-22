@@ -600,24 +600,28 @@ def run_hermes_watchdog(env_dict):
 
 
 def get_rss_mb() -> float:
-    """Get current RSS (not peak) in MB."""
+    """Get current RSS (not peak) in MB of both proxy and agent."""
+    total_rss = 0.0
+    
+    # 1. Proxy RSS
     try:
-        # Linux (Render) — read current RSS from /proc
         with open("/proc/self/statm") as f:
             pages = int(f.read().split()[1])
-            return (pages * os.sysconf("SC_PAGE_SIZE")) / (1024 * 1024)
+            total_rss += (pages * os.sysconf("SC_PAGE_SIZE")) / (1024 * 1024)
     except Exception:
         pass
-    try:
-        # macOS fallback (development)
-        import resource
-
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if sys.platform == "darwin":
-            return rss / (1024 * 1024)
-        return rss / 1024
-    except Exception:
-        return 0
+        
+    # 2. Agent RSS
+    global hermes_proc
+    if hermes_proc and hermes_proc.pid:
+        try:
+            with open(f"/proc/{hermes_proc.pid}/statm") as f:
+                pages = int(f.read().split()[1])
+                total_rss += (pages * os.sysconf("SC_PAGE_SIZE")) / (1024 * 1024)
+        except Exception:
+            pass
+            
+    return total_rss
 
 
 def memory_watchdog():
