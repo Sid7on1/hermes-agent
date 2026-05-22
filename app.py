@@ -863,7 +863,10 @@ if config_dst.exists():
         # 2. Inject Telegram Proxy URL if provided
         tg_proxy = os.environ.get("TELEGRAM_API_URL")
         if tg_proxy:
-            cfg.setdefault("telegram", {}).setdefault("extra", {})["base_url"] = tg_proxy.rstrip("/")
+            tg_proxy = tg_proxy.rstrip("/")
+            if not tg_proxy.endswith("/bot"):
+                tg_proxy += "/bot"
+            cfg.setdefault("telegram", {}).setdefault("extra", {})["base_url"] = tg_proxy
             
         with open(config_dst, "w") as f:
             yaml.dump(cfg, f)
