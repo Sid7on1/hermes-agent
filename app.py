@@ -64,9 +64,16 @@ BOOT_TIME = time.time()
 # ║  only files whose mtime or size changed get re-uploaded.     ║
 # ╚══════════════════════════════════════════════════════════════╝
 
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_KEY")
-supabase_client = None
+supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+supabase_key = os.environ.get("SUPABASE_KEY")  # service_role key
+supabase_ready = bool(supabase_url and supabase_key)
+
+# Direct REST headers — no SDK needed, saves ~50 MB RAM
+_sb_headers = (
+    {"Authorization": f"Bearer {supabase_key}", "apikey": supabase_key}
+    if supabase_ready
+    else {}
+)
 
 sync_lock = threading.Lock()
 sync_manifest = {}  # rel_path -> {size, mtime, synced_at}
@@ -78,13 +85,21 @@ sync_stats = {
     "files_synced": [],
 }
 
-if supabase_url and supabase_key:
+if supabase_ready:
+    # Verify connection with a quick HEAD request to the bucket
     try:
-        from supabase import create_client, Client
-        supabase_client: Client = create_client(supabase_url, supabase_key)
-        print("[SYNC] ✅ Supabase Storage connected", flush=True)
+        r = http_requests.get(
+            f"{supabase_url}/storage/v1/bucket/{SUPABASE_BUCKET}",
+            headers=_sb_headers,
+            timeout=10,
+        )
+        if r.status_code == 200:
+            print("[SYNC] ✅ Supabase Storage connected (direct REST)", flush=True)
+        else:
+            print(f"[SYNC] ⚠️ Supabase bucket check: HTTP {r.status_code}", flush=True)
     except Exception as e:
         print(f"[SYNC] ❌ Supabase connection failed: {e}", flush=True)
+        supabase_ready = False
 
 
 def _should_sync(rel_path: str) -> bool:
@@ -130,37 +145,53 @@ def _checkpoint_sqlite():
 
 def _download_one(rel_path: str) -> bool:
     """Download a single file from Supabase Storage to ~/.hermes/."""
-    if not supabase_client:
+    if not supabase_ready:
         return False
     try:
-        data = supabase_client.storage.from_(SUPABASE_BUCKET).download(rel_path)
-        local = HERMES_HOME / rel_path
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_bytes(data)
-        sync_stats["downloads"] += 1
-        return True
-    except Exception as e:
-        msg = str(e).lower()
-        if "404" in msg or "not found" in msg:
+        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/{rel_path}"
+        r = http_requests.get(url, headers=_sb_headers, timeout=30)
+        if r.status_code == 200:
+            local = HERMES_HOME / rel_path
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(r.content)
+            sync_stats["downloads"] += 1
+            return True
+        elif r.status_code == 404:
             return False  # expected on first run
+        else:
+            print(f"[SYNC] Download failed: {rel_path} — HTTP {r.status_code}", flush=True)
+            sync_stats["errors"] += 1
+            return False
+    except Exception as e:
         print(f"[SYNC] Download failed: {rel_path} — {e}", flush=True)
         sync_stats["errors"] += 1
         return False
 
 
 def _upload_one(rel_path: str) -> bool:
-    """Upload a single file from ~/.hermes/ to Supabase Storage."""
-    if not supabase_client:
+    """Upload a single file from ~/.hermes/ to Supabase Storage (upsert)."""
+    if not supabase_ready:
         return False
     local = HERMES_HOME / rel_path
     if not local.exists():
         return False
     try:
-        supabase_client.storage.from_(SUPABASE_BUCKET).upload(
-            rel_path, local.read_bytes(), {"upsert": "true"}
-        )
-        sync_stats["uploads"] += 1
-        return True
+        file_data = local.read_bytes()
+        # Guess content type
+        ct = "application/octet-stream"
+        if rel_path.endswith((".json", ".yaml", ".yml", ".md", ".txt", ".env")):
+            ct = "text/plain"
+
+        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/{rel_path}"
+        headers = {**_sb_headers, "Content-Type": ct, "x-upsert": "true"}
+        r = http_requests.post(url, headers=headers, data=file_data, timeout=30)
+        if r.status_code in (200, 201):
+            sync_stats["uploads"] += 1
+            return True
+        else:
+            print(f"[SYNC] Upload failed: {rel_path} — HTTP {r.status_code}: {r.text[:200]}", flush=True)
+            sync_stats["errors"] += 1
+            return False
     except Exception as e:
         print(f"[SYNC] Upload failed: {rel_path} — {e}", flush=True)
         sync_stats["errors"] += 1
@@ -169,24 +200,29 @@ def _upload_one(rel_path: str) -> bool:
 
 def _load_manifest() -> dict:
     """Download the sync manifest from Supabase."""
-    if not supabase_client:
+    if not supabase_ready:
         return {}
     try:
-        data = supabase_client.storage.from_(SUPABASE_BUCKET).download("_manifest.json")
-        return json.loads(data.decode("utf-8"))
+        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/_manifest.json"
+        r = http_requests.get(url, headers=_sb_headers, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        return {}
     except Exception:
         return {}
 
 
 def _save_manifest():
     """Upload the sync manifest to Supabase."""
-    if not supabase_client:
+    if not supabase_ready:
         return
     try:
         data = json.dumps(sync_manifest, indent=2, default=str).encode("utf-8")
-        supabase_client.storage.from_(SUPABASE_BUCKET).upload(
-            "_manifest.json", data, {"upsert": "true"}
-        )
+        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/_manifest.json"
+        headers = {**_sb_headers, "Content-Type": "application/json", "x-upsert": "true"}
+        r = http_requests.post(url, headers=headers, data=data, timeout=15)
+        if r.status_code not in (200, 201):
+            print(f"[SYNC] Manifest save failed: HTTP {r.status_code}", flush=True)
     except Exception as e:
         print(f"[SYNC] Manifest save failed: {e}", flush=True)
 
@@ -200,7 +236,7 @@ def sync_download_all():
     the agent previously created.
     """
     global sync_manifest
-    if not supabase_client:
+    if not supabase_ready:
         return
 
     print("[SYNC] 📥 Restoring state from Supabase...", flush=True)
@@ -240,7 +276,7 @@ def sync_upload_changed():
     """
     global sync_manifest
     with sync_lock:
-        if not supabase_client:
+        if not supabase_ready:
             return
 
         _checkpoint_sqlite()
@@ -270,7 +306,7 @@ def sync_upload_all():
     """Force-upload everything (used on shutdown)."""
     global sync_manifest
     with sync_lock:
-        if not supabase_client:
+        if not supabase_ready:
             return
 
         _checkpoint_sqlite()
@@ -658,7 +694,7 @@ def health():
             "detail": keys_detail,
         },
         "sync": {
-            "connected": supabase_client is not None,
+            "connected": supabase_ready,
             "total_uploads": sync_stats["uploads"],
             "total_downloads": sync_stats["downloads"],
             "errors": sync_stats["errors"],
@@ -754,7 +790,7 @@ def shutdown(signum, frame):
     _kill_hermes()
     print("[SHUTDOWN] Hermes stopped", flush=True)
 
-    if supabase_client:
+    if supabase_ready:
         print("[SHUTDOWN] Saving ALL state to Supabase...", flush=True)
         sync_upload_all()
         print("[SHUTDOWN] ✅ State saved", flush=True)
@@ -868,7 +904,7 @@ threading.Thread(
 ).start()
 
 # Periodic state sync
-if supabase_client:
+if supabase_ready:
 
     def _periodic_sync_loop():
         while True:
