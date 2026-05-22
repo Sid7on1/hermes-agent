@@ -715,8 +715,12 @@ def run_hermes_watchdog(env: dict) -> None:
 def _rss_mb() -> float:
     """
     Combined RSS (proxy + Hermes agent) in megabytes via /proc/<pid>/statm.
-    Fails gracefully — returns 0.0 if /proc is unavailable.
+    Fails gracefully to macOS getrusage or returns 0.0.
     """
+    if sys.platform == "darwin":
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+
     page_bytes = os.sysconf("SC_PAGE_SIZE")
 
     def _read(pid: int) -> float:
@@ -897,8 +901,6 @@ def _stream(resp: requests.Response, chunk_size: int | None = None) -> Generator
         for chunk in resp.iter_content(chunk_size=chunk_size):
             if chunk:
                 yield chunk
-    except Exception as exc:
-        log.debug("PROXY stream interrupted: %s", exc)
     finally:
         resp.close()
 
