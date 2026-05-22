@@ -35,9 +35,9 @@ SYNC_EXCLUDE_SUFFIXES = frozenset({".pyc", ".pyo", "-wal", "-shm", ".log", ".tmp
 
 # Memory
 MEMORY_CHECK_INTERVAL = 30       # seconds
-MEMORY_WARNING_MB = 380          # early sync trigger
-MEMORY_CRITICAL_MB = 450         # GC + sync
-MEMORY_LIMIT_MB = 512            # Render free tier
+MEMORY_WARNING_MB = 6000         # early sync trigger
+MEMORY_CRITICAL_MB = 8000        # GC + sync
+MEMORY_LIMIT_MB = 16384          # Hugging Face Spaces free tier
 
 # Key rotation
 KEY_COOLDOWN_BASE = 2.0          # seconds — base cooldown after 429
