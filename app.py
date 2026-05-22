@@ -339,8 +339,13 @@ def sync_upload_all():
 nvidia_keys = []
 for i in range(1, 7):
     val = os.environ.get(f"NVIDIA_NIM_KEY_{i}")
-    if val:
+    if val and val not in nvidia_keys:
         nvidia_keys.append(val)
+
+# Fallback to standard NVIDIA_API_KEY environment variable
+api_key_val = os.environ.get("NVIDIA_API_KEY")
+if api_key_val and api_key_val not in nvidia_keys:
+    nvidia_keys.append(api_key_val)
 
 key_lock = threading.Lock()
 key_index = 0
@@ -365,34 +370,43 @@ def _is_probe(path: str) -> bool:
     return path in PROBE_PATHS or path.startswith("api/")
 
 
-def get_next_key():
+def get_next_key(exclude_indices=None):
     """Thread-safe key selection with adaptive cooldown.
 
     Returns (key_value, key_index) or (None, None) if all exhausted.
     Never permanently disables a key — uses time-based cooldowns only.
     """
     global key_index
+    if exclude_indices is None:
+        exclude_indices = set()
+
     with key_lock:
         if not nvidia_keys:
             return None, None
         n = len(nvidia_keys)
         now = time.time()
 
-        # Pass 1: find a key that's off cooldown
+        eligible_indices = [i for i in range(n) if i not in exclude_indices]
+        if not eligible_indices:
+            return None, None
+
+        # Pass 1: find an eligible key that's off cooldown
         for _ in range(n):
             idx = key_index % n
             key_index += 1
+            if idx in exclude_indices:
+                continue
             if now >= key_state[idx]["cooldown_until"]:
                 key_state[idx]["last_used"] = now
                 return nvidia_keys[idx], idx
 
-        # Pass 2: all on cooldown — pick the one that's soonest available
-        soonest_idx = min(range(n), key=lambda i: key_state[i]["cooldown_until"])
+        # Pass 2: all eligible keys on cooldown — pick the one that's soonest available
+        soonest_idx = min(eligible_indices, key=lambda i: key_state[i]["cooldown_until"])
         key_state[soonest_idx]["last_used"] = now
         return nvidia_keys[soonest_idx], soonest_idx
 
 
-def report_key_result(idx: int, status_code: int):
+def report_key_result(idx: int, status_code: int, headers=None):
     """Update per-key state based on API response."""
     with key_lock:
         s = key_state[idx]
@@ -407,11 +421,23 @@ def report_key_result(idx: int, status_code: int):
         elif status_code == 429:
             s["consecutive_429"] += 1
             s["total_fail"] += 1
-            # Exponential cooldown: 2, 4, 8, 16... capped
-            cooldown = min(
-                KEY_COOLDOWN_BASE * (2 ** (s["consecutive_429"] - 1)),
-                KEY_COOLDOWN_MAX,
-            )
+
+            cooldown = None
+            if headers:
+                retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        cooldown = float(retry_after)
+                    except ValueError:
+                        pass
+            
+            if cooldown is None:
+                # Exponential cooldown: 2, 4, 8, 16... capped
+                cooldown = min(
+                    KEY_COOLDOWN_BASE * (2 ** (s["consecutive_429"] - 1)),
+                    KEY_COOLDOWN_MAX,
+                )
+            
             s["cooldown_until"] = now + cooldown
             print(
                 f"[PROXY] Key #{idx+1} rate-limited (429) — "
@@ -434,6 +460,11 @@ def report_key_result(idx: int, status_code: int):
             s["total_fail"] += 1
             s["cooldown_until"] = now + 5.0
             print(f"[PROXY] Key #{idx+1} unauthorized (401) — cooldown 5s", flush=True)
+
+        elif status_code >= 500:
+            s["total_fail"] += 1
+            s["cooldown_until"] = now + 3.0
+            print(f"[PROXY] Key #{idx+1} server error ({status_code}) — cooldown 3s", flush=True)
 
 
 # ╔══════════════════════════════════════════════════════════════╗
@@ -759,10 +790,14 @@ def proxy(path):
     )
 
     max_attempts = len(nvidia_keys)
+    tried_indices = set()
+    last_resp = None
+
     for attempt in range(max_attempts):
-        key_val, idx = get_next_key()
-        if key_val is None:
+        key_val, idx = get_next_key(tried_indices)
+        if idx is None:
             break
+        tried_indices.add(idx)
 
         headers["Authorization"] = f"Bearer {key_val}"
         log_path = path.split("/")[-1]  # shorten for logging
@@ -792,18 +827,43 @@ def proxy(path):
             print(f"[PROXY] Connection error: {e}", flush=True)
             continue
 
-        if resp.status_code in (401, 403):
-            report_key_result(idx, resp.status_code)
-            resp.close()
+        if resp.status_code in (401, 403, 429) or resp.status_code >= 500:
+            report_key_result(idx, resp.status_code, resp.headers)
+            if last_resp:
+                last_resp.close()
+            last_resp = resp
             continue
 
-        # Pass through to Hermes — including 429s (Hermes has its own retry logic)
-        # but still track the 429 so we put this key on cooldown for next request
-        report_key_result(idx, resp.status_code)
+        report_key_result(idx, resp.status_code, resp.headers)
+        if last_resp:
+            last_resp.close()
+
         resp_headers = [
             (n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded
         ]
-        return Response(resp.iter_content(chunk_size=4096), resp.status_code, resp_headers)
+
+        def generate_success():
+            try:
+                for chunk in resp.iter_content(chunk_size=4096):
+                    yield chunk
+            finally:
+                resp.close()
+
+        return Response(generate_success(), resp.status_code, resp_headers)
+
+    if last_resp:
+        resp_headers = [
+            (n, v) for n, v in last_resp.raw.headers.items() if n.lower() not in excluded
+        ]
+
+        def generate_failure():
+            try:
+                for chunk in last_resp.iter_content(chunk_size=4096):
+                    yield chunk
+            finally:
+                last_resp.close()
+
+        return Response(generate_failure(), last_resp.status_code, resp_headers)
 
     return "All NVIDIA keys exhausted or on cooldown — try again shortly", 503
 
