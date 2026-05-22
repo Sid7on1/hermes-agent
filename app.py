@@ -42,7 +42,7 @@ MEMORY_LIMIT_MB = 16384          # Hugging Face Spaces free tier
 # Key rotation
 KEY_COOLDOWN_BASE = 2.0          # seconds — base cooldown after 429
 KEY_COOLDOWN_MAX = 30.0          # seconds — max cooldown per key
-KEY_REQUEST_TIMEOUT = (10, 120)  # (connect, read) — generous read for streaming
+KEY_REQUEST_TIMEOUT = (10, 300)  # (connect, read) — 5 mins for heavy model cold-starts
 
 # Hermes watchdog
 HERMES_STARTUP_DELAY = 45        # seconds — let old Telegram poll lock expire
@@ -784,7 +784,6 @@ def proxy(path):
         for k, v in request.headers
         if k.lower() not in ("host", "authorization")
     }
-    headers["Connection"] = "close"  # prevent stale socket reuse after idle periods
     excluded = frozenset(
         {"content-encoding", "content-length", "transfer-encoding", "connection"}
     )
@@ -822,9 +821,11 @@ def proxy(path):
                 f"[PROXY] Key #{idx+1} timed out ({KEY_REQUEST_TIMEOUT}s)",
                 flush=True,
             )
+            report_key_result(idx, 504)  # Put on cooldown
             continue
         except http_requests.ConnectionError as e:
             print(f"[PROXY] Connection error: {e}", flush=True)
+            report_key_result(idx, 502)  # Put on cooldown
             continue
 
         if resp.status_code in (401, 403, 429) or resp.status_code >= 500:
@@ -844,8 +845,10 @@ def proxy(path):
 
         def generate_success():
             try:
-                for chunk in resp.iter_content(chunk_size=4096):
-                    yield chunk
+                # Use tiny chunk size to stream SSE exactly as it arrives without buffering
+                for chunk in resp.iter_content(chunk_size=64):
+                    if chunk:
+                        yield chunk
             finally:
                 resp.close()
 
@@ -858,8 +861,9 @@ def proxy(path):
 
         def generate_failure():
             try:
-                for chunk in last_resp.iter_content(chunk_size=4096):
-                    yield chunk
+                for chunk in last_resp.iter_content(chunk_size=64):
+                    if chunk:
+                        yield chunk
             finally:
                 last_resp.close()
 
