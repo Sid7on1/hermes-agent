@@ -830,7 +830,7 @@ if honcho_key:
     if not honcho_config.exists():
         honcho_config.write_text(json.dumps({"enabled": True}))
 
-# Email credentials (AOL / Gmail App Password)
+# Email and GitHub credentials
 for evar in (
     "EMAIL_ADDRESS",
     "EMAIL_PASSWORD",
@@ -838,6 +838,8 @@ for evar in (
     "EMAIL_IMAP_PORT",
     "EMAIL_SMTP_HOST",
     "EMAIL_SMTP_PORT",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
 ):
     val = os.environ.get(evar)
     if val:
