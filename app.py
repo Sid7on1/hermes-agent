@@ -845,14 +845,13 @@ def proxy(path):
 
         def generate_success():
             try:
-                # Use tiny chunk size to stream SSE exactly as it arrives without buffering
-                for chunk in resp.iter_content(chunk_size=64):
+                for chunk in resp.iter_content(chunk_size=4096):
                     if chunk:
                         yield chunk
             finally:
                 resp.close()
 
-        return Response(generate_success(), resp.status_code, resp_headers)
+        return Response(generate_success(), resp.status_code, resp_headers, direct_passthrough=True)
 
     if last_resp:
         resp_headers = [
@@ -861,13 +860,13 @@ def proxy(path):
 
         def generate_failure():
             try:
-                for chunk in last_resp.iter_content(chunk_size=64):
+                for chunk in last_resp.iter_content(chunk_size=4096):
                     if chunk:
                         yield chunk
             finally:
                 last_resp.close()
 
-        return Response(generate_failure(), last_resp.status_code, resp_headers)
+        return Response(generate_failure(), last_resp.status_code, resp_headers, direct_passthrough=True)
 
     return "All NVIDIA keys exhausted or on cooldown — try again shortly", 503
 
