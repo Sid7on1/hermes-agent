@@ -845,7 +845,7 @@ def proxy(path):
 
         def generate_success():
             try:
-                for chunk in resp.iter_content(chunk_size=4096):
+                for chunk in resp.iter_content(chunk_size=None):
                     if chunk:
                         yield chunk
             finally:
@@ -860,7 +860,7 @@ def proxy(path):
 
         def generate_failure():
             try:
-                for chunk in last_resp.iter_content(chunk_size=4096):
+                for chunk in last_resp.iter_content(chunk_size=None):
                     if chunk:
                         yield chunk
             finally:
