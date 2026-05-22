@@ -779,7 +779,7 @@ def memory_watchdog() -> None:
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
-    "content-encoding", "content-length",
+    "content-encoding", "content-length", "host"
 })
 
 
