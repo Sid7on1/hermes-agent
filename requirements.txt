@@ -3,3 +3,5 @@ hermes-agent[messaging] @ git+https://github.com/NousResearch/Hermes-Agent.git
 requests
 psycopg2-binary
 pillow
+playwright
+websockets
