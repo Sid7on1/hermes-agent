@@ -4,6 +4,7 @@ import sys
 import subprocess
 import threading
 import time
+import resource
 from pathlib import Path
 from io import BytesIO
 
@@ -49,6 +50,14 @@ def upload_to_supabase(path_str):
         except Exception as e:
             print(f"[FLASK] Supabase Sync: Upload failed for {path_str} ({e})", flush=True)
 
+def sync_all_to_supabase():
+    """Upload all state files to Supabase."""
+    if not supabase_client:
+        return
+    upload_to_supabase("state.db")
+    upload_to_supabase("config.yaml")
+    upload_to_supabase(".env")
+
 # Restore state from cloud
 if supabase_client:
     download_from_supabase("state.db")
@@ -86,7 +95,84 @@ if honcho_key:
 
 dotenv_path.write_text("\n".join(lines) + "\n")
 
-key_cycle = itertools.cycle(nvidia_keys) if nvidia_keys else None
+# --- Thread-safe key rotation with per-key rate tracking ---
+key_lock = threading.Lock()
+key_index = 0
+key_last_used = {}        # key_index -> last_used_timestamp
+key_fail_count = {}       # key_index -> consecutive 403 count
+key_blacklisted = set()   # set of blacklisted key indices
+KEY_COOLDOWN_SECS = 1.5   # minimum seconds between uses of the same key
+KEY_BLACKLIST_THRESHOLD = 3  # 403s before blacklisting
+
+def get_next_key():
+    """Get the next available key, respecting cooldowns and blacklist.
+    Returns (key_value, key_idx) or (None, None) if all keys exhausted."""
+    global key_index
+    with key_lock:
+        if not nvidia_keys:
+            return None, None
+        now = time.time()
+        n = len(nvidia_keys)
+        # Try up to n keys to find one that's not blacklisted and not on cooldown
+        for _ in range(n):
+            idx = key_index % n
+            key_index += 1
+            if idx in key_blacklisted:
+                continue
+            last = key_last_used.get(idx, 0)
+            if now - last < KEY_COOLDOWN_SECS:
+                continue
+            key_last_used[idx] = now
+            return nvidia_keys[idx], idx
+        # All keys on cooldown or blacklisted — return the least recently used non-blacklisted key
+        available = [(key_last_used.get(i, 0), i) for i in range(n) if i not in key_blacklisted]
+        if not available:
+            return None, None
+        available.sort()
+        idx = available[0][1]
+        key_last_used[idx] = now
+        return nvidia_keys[idx], idx
+
+def report_key_success(idx):
+    """Reset failure counter on successful use."""
+    with key_lock:
+        key_fail_count[idx] = 0
+
+def report_key_failure(idx, status_code):
+    """Track 403 failures and blacklist after threshold."""
+    if status_code != 403:
+        return
+    with key_lock:
+        key_fail_count[idx] = key_fail_count.get(idx, 0) + 1
+        count = key_fail_count[idx]
+        if count >= KEY_BLACKLIST_THRESHOLD:
+            key_blacklisted.add(idx)
+            active = len(nvidia_keys) - len(key_blacklisted)
+            print(f"[FLASK-PROXY] ⛔ Key #{idx+1} blacklisted after {count} consecutive 403s. "
+                  f"Active keys: {active}/{len(nvidia_keys)}", flush=True)
+        else:
+            print(f"[FLASK-PROXY] ⚠️ Key #{idx+1} rejected (403) — failure {count}/{KEY_BLACKLIST_THRESHOLD}",
+                  flush=True)
+
+# --- Probe request filtering ---
+# Hermes probes these endpoints to detect backend type; they never exist on NVIDIA.
+# Returning 404 immediately avoids consuming a key rotation.
+PROBE_PATHS = frozenset({"props", "version"})
+PROBE_PREFIXES = ("api/",)
+
+def is_probe_request(path):
+    """Returns True if this is a Hermes backend-detection probe that should be short-circuited."""
+    if path in PROBE_PATHS:
+        return True
+    for prefix in PROBE_PREFIXES:
+        if path.startswith(prefix):
+            return True
+    return False
+
+# --------------------------
+
+port = int(os.environ.get("PORT", 8080))
+local_proxy_url = f"http://127.0.0.1:{port}/v1"
 
 env = os.environ.copy()
 env["HERMES_HOME"] = str(hermes_home)
@@ -100,23 +186,22 @@ for i in range(1, 7):
 if "NVIDIA_NIM_KEY_1" in env:
     env.setdefault("NVIDIA_API_KEY", env["NVIDIA_NIM_KEY_1"])
 
+env["NVIDIA_BASE_URL"] = local_proxy_url
+env["NVIDIA_API_BASE"] = local_proxy_url
+env["OPENAI_BASE_URL"] = local_proxy_url
+
 if os.environ.get("DATABASE_URL"):
     print("[FLASK] Supabase Memory: Enabled", flush=True)
 else:
     print("[FLASK] Supabase Memory: Not configured (add DATABASE_URL to Render)", flush=True)
 
-port = int(os.environ.get("PORT", 8080))
-local_proxy_url = f"http://127.0.0.1:{port}/v1"
-env["NVIDIA_BASE_URL"] = local_proxy_url
-env["NVIDIA_API_BASE"] = local_proxy_url
-env["OPENAI_BASE_URL"] = local_proxy_url
+print(f"[FLASK] NVIDIA keys loaded: {len(nvidia_keys)}", flush=True)
 
 hermes_proc = None
 
 def run_hermes():
     global hermes_proc
     print("[FLASK] Waiting 45 seconds to avoid Telegram polling conflict from old container...", flush=True)
-    import time
     time.sleep(45)
     print("[FLASK] Starting Hermes Gateway...", flush=True)
     hermes_proc = subprocess.Popen(
@@ -136,6 +221,60 @@ def run_hermes():
 threading.Thread(target=run_hermes, daemon=True).start()
 
 
+# --- Periodic state sync (every 10 min) ---
+# This ensures state.db is saved even if the process is OOM-killed (SIGKILL skips shutdown handler)
+def periodic_sync():
+    while True:
+        time.sleep(600)  # 10 minutes
+        print("[FLASK] Periodic sync: saving state to Supabase...", flush=True)
+        try:
+            sync_all_to_supabase()
+            print("[FLASK] Periodic sync: complete", flush=True)
+        except Exception as e:
+            print(f"[FLASK] Periodic sync: failed ({e})", flush=True)
+
+if supabase_client:
+    threading.Thread(target=periodic_sync, daemon=True).start()
+    print("[FLASK] Periodic sync: enabled (every 10 min)", flush=True)
+
+
+# --- Memory monitoring (every 60s) ---
+MEMORY_WARNING_MB = 400   # trigger early sync
+MEMORY_LIMIT_MB = 512     # Render free tier limit
+
+def get_rss_mb():
+    """Get current RSS memory usage in MB."""
+    try:
+        rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS returns bytes, Linux returns KB
+        if sys.platform == "darwin":
+            return rss_bytes / (1024 * 1024)
+        else:
+            return rss_bytes / 1024
+    except Exception:
+        return 0
+
+def memory_monitor():
+    warned = False
+    while True:
+        time.sleep(60)
+        rss = get_rss_mb()
+        active_keys = len(nvidia_keys) - len(key_blacklisted)
+        print(f"[FLASK] Memory: {rss:.0f} MB / {MEMORY_LIMIT_MB} MB | "
+              f"Keys: {active_keys}/{len(nvidia_keys)} active", flush=True)
+        if rss > MEMORY_WARNING_MB and not warned:
+            warned = True
+            print(f"[FLASK] ⚠️ Memory above {MEMORY_WARNING_MB} MB — triggering early Supabase sync", flush=True)
+            try:
+                sync_all_to_supabase()
+            except Exception as e:
+                print(f"[FLASK] Early sync failed: {e}", flush=True)
+        elif rss <= MEMORY_WARNING_MB:
+            warned = False
+
+threading.Thread(target=memory_monitor, daemon=True).start()
+
+
 def shutdown(signum, frame):
     print("[FLASK] Received shutdown signal...", flush=True)
     if hermes_proc is not None:
@@ -148,9 +287,7 @@ def shutdown(signum, frame):
     # Save state to cloud
     if supabase_client:
         print("[FLASK] Saving memory to Supabase...", flush=True)
-        upload_to_supabase("state.db")
-        upload_to_supabase("config.yaml")
-        upload_to_supabase(".env")
+        sync_all_to_supabase()
     
     sys.exit(0)
 
@@ -163,9 +300,29 @@ signal.signal(signal.SIGINT, shutdown)
 def index():
     return "Hermes Status: ONLINE", 200, {"Content-Type": "text/plain"}
 
+@app.route("/health")
+def health():
+    rss = get_rss_mb()
+    active_keys = len(nvidia_keys) - len(key_blacklisted)
+    status = {
+        "status": "online",
+        "memory_mb": round(rss, 1),
+        "memory_limit_mb": MEMORY_LIMIT_MB,
+        "nvidia_keys_active": active_keys,
+        "nvidia_keys_total": len(nvidia_keys),
+        "nvidia_keys_blacklisted": list(key_blacklisted),
+        "hermes_running": hermes_proc is not None and hermes_proc.poll() is None,
+    }
+    import json
+    return json.dumps(status, indent=2), 200, {"Content-Type": "application/json"}
+
 @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy(path):
-    if not key_cycle:
+    # Short-circuit probe requests — don't waste key rotations
+    if is_probe_request(path):
+        return "Not Found", 404
+
+    if not nvidia_keys:
         return "No NVIDIA keys configured", 500
     
     target_url = f"https://integrate.api.nvidia.com/v1/{path}"
@@ -174,11 +331,17 @@ def proxy(path):
     
     excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
     
-    max_attempts = len(nvidia_keys)
+    max_attempts = len(nvidia_keys) - len(key_blacklisted)
+    if max_attempts <= 0:
+        return "All NVIDIA keys blacklisted (403). Check your keys in Render env vars.", 503
+    
     for attempt in range(max_attempts):
-        next_key = next(key_cycle)
+        next_key, idx = get_next_key()
+        if next_key is None:
+            break
+        
         headers["Authorization"] = f"Bearer {next_key}"
-        print(f"[FLASK-PROXY] Attempt {attempt+1}/{max_attempts} to {target_url} with key...", flush=True)
+        print(f"[FLASK-PROXY] Attempt {attempt+1}/{max_attempts} to {target_url} (key #{idx+1})", flush=True)
         
         resp = requests.request(
             method=request.method,
@@ -190,12 +353,19 @@ def proxy(path):
             stream=True
         )
         
-        if resp.status_code not in (401, 403):
-            resp_headers = [(name, value) for (name, value) in resp.raw.headers.items()
-                       if name.lower() not in excluded_headers]
-            return Response(resp.iter_content(chunk_size=1024), resp.status_code, resp_headers)
+        if resp.status_code == 403:
+            report_key_failure(idx, 403)
+            continue
+        elif resp.status_code == 401:
+            report_key_failure(idx, 401)
+            print(f"[FLASK-PROXY] Key #{idx+1} unauthorized (401)", flush=True)
+            continue
         
-        print(f"[FLASK-PROXY] Key rejected ({resp.status_code}), trying next...", flush=True)
+        # Success (or a non-auth error like 429 that Hermes handles with its own retry)
+        report_key_success(idx)
+        resp_headers = [(name, value) for (name, value) in resp.raw.headers.items()
+                   if name.lower() not in excluded_headers]
+        return Response(resp.iter_content(chunk_size=1024), resp.status_code, resp_headers)
     
     return "All NVIDIA keys failed authentication", 503
 

@@ -3,3 +3,4 @@ git+https://github.com/NousResearch/Hermes-Agent.git#egg=hermes-agent[messaging]
 requests
 psycopg2-binary
 supabase
+pillow
