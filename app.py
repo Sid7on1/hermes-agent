@@ -753,6 +753,7 @@ def proxy(path):
         for k, v in request.headers
         if k.lower() not in ("host", "authorization")
     }
+    headers["Connection"] = "close"  # prevent stale socket reuse after idle periods
     excluded = frozenset(
         {"content-encoding", "content-length", "transfer-encoding", "connection"}
     )
@@ -873,6 +874,9 @@ for evar in (
     if val:
         dotenv_lines.append(f"{evar}={val}")
 
+# Agent gateway timeout — default 600s is too aggressive for complex tasks
+dotenv_lines.append("HERMES_AGENT_TIMEOUT=1800")
+
 (HERMES_HOME / ".env").write_text("\n".join(dotenv_lines) + "\n")
 
 # --- 3. Copy config.yaml from repo if not already present ---
@@ -897,7 +901,10 @@ if config_dst.exists():
             if not tg_proxy.endswith("/bot"):
                 tg_proxy += "/bot"
             cfg.setdefault("telegram", {}).setdefault("extra", {})["base_url"] = tg_proxy
-            
+
+        # 3. Extend gateway inactivity timeout (default 600s is too short)
+        cfg.setdefault("agent", {})["gateway_timeout"] = 1800
+
         with open(config_dst, "w") as f:
             yaml.dump(cfg, f)
     except Exception as e:
