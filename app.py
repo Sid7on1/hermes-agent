@@ -708,6 +708,34 @@ def health():
     return json.dumps(status, indent=2, default=str), 200, {"Content-Type": "application/json"}
 
 
+# --- Fallback routes for Ollama / misc backend probes ---
+# Hermes probes these on startup to detect what kind of API it's talking to.
+# Without these, they 404 and flood the logs.
+
+@app.route("/api/v1/models", methods=["GET"])
+@app.route("/api/tags", methods=["GET"])
+def ollama_models_fallback():
+    """Return an empty model list so Ollama-style probes don't 404."""
+    return json.dumps({"models": []}), 200, {"Content-Type": "application/json"}
+
+
+@app.route("/api/show", methods=["POST"])
+def ollama_show_fallback():
+    """Return a stub response for Ollama model-info probes."""
+    return json.dumps({"details": {"parent_model": ""}}), 200, {"Content-Type": "application/json"}
+
+
+@app.route("/v1/props", methods=["GET"])
+@app.route("/props", methods=["GET"])
+def props_fallback():
+    return json.dumps({}), 200, {"Content-Type": "application/json"}
+
+
+@app.route("/version", methods=["GET"])
+def version_fallback():
+    return json.dumps({"version": "proxy-1.0"}), 200, {"Content-Type": "application/json"}
+
+
 @app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 def proxy(path):
     """NVIDIA API proxy with adaptive key rotation and cooldowns."""
