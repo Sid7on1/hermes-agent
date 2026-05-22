@@ -1,1091 +1,1254 @@
-import os
+#!/usr/bin/env python3
+"""
+app.py — Hermes Proxy · Watchdog · State Sync Engine
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Production-hardened rewrite. Fixes:
+  • Signal handler → non-blocking shutdown thread (no deadlock risk)
+  • All shared state gated behind appropriate locks
+  • time.monotonic() throughout for cooldown/uptime timing
+  • Shared requests.Session with a real connection pool
+  • Streaming generator captures value not closure variable
+  • All response objects guaranteed-closed via try/finally
+  • sync_manifest/sync_stats/hermes_status all thread-safe
+  • Key cooldown jitter prevents thundering-herd re-429
+  • Watchdog uses threading.Event for clean sleep + wakeup
+  • WAL checkpoint owns its own connection + proper timeout
+  • SYNC_EXCLUDE_SUFFIXES no longer contains dead -wal/-shm entries
+  • Health endpoint snapshots all shared state under lock before serialising
+  • keep-alive / periodic-sync threads exit cleanly on shutdown
+  • mimetypes.guess_type for correct Content-Type on upload
+  • Per-file upload timeout scaled by file size
+  • dataclass KeyState — no raw dict mutation bugs
+  • Structured logging replaces ad-hoc print() calls
+  • atexit + signal both route to single idempotent _graceful_shutdown()
+  • deque(maxlen=N) replaces list[-10:] slice assignment race
+"""
+
+from __future__ import annotations
+
+import atexit
 import gc
 import json
+import logging
+import mimetypes
+import os
+import random
 import signal
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Generator
 
-import requests as http_requests
-from flask import Flask, request, Response
+import requests
+from requests.adapters import HTTPAdapter
 import yaml
+from flask import Flask, Response, request as flask_req
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                      CONFIGURATION                          ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ══════════════════════════════════════════════════════════════
+#  LOGGING
+# ══════════════════════════════════════════════════════════════
 
-app = Flask(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)-14s] %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
+log = logging.getLogger("hermes")
+
+# ══════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ══════════════════════════════════════════════════════════════
 
 HERMES_HOME = Path.home() / ".hermes"
 HERMES_HOME.mkdir(parents=True, exist_ok=True)
 
-# Supabase
-SUPABASE_BUCKET = "hermes-state"
+SUPABASE_BUCKET        = "hermes-state"
+SYNC_INTERVAL_SECS     = 600
+MAX_SYNC_FILE_MB       = 50
+SYNC_EXCLUDE_DIRS      = frozenset({"__pycache__", ".git", "cache", "sandbox", "tmp"})
+# Only real file-extension suffixes here — "-wal" / "-shm" are NOT extensions
+# and would never match Path.suffix. They are handled separately below.
+SYNC_EXCLUDE_SUFFIXES  = frozenset({".pyc", ".pyo", ".log", ".tmp"})
+SYNC_EXCLUDE_TAILS     = ("-wal", "-shm")   # matched via str.endswith()
 
-# Sync
-SYNC_INTERVAL_SECS = 600         # periodic incremental sync every 10 min
-MAX_SYNC_FILE_SIZE_MB = 50       # skip files larger than this
-# Exclude transient/regenerable dirs — everything else is synced
-SYNC_EXCLUDE_DIRS = frozenset({"__pycache__", ".git", "cache", "sandbox", "tmp"})
-SYNC_EXCLUDE_SUFFIXES = frozenset({".pyc", ".pyo", "-wal", "-shm", ".log", ".tmp"})
+MEM_CHECK_INTERVAL     = 30            # seconds
+MEM_WARNING_MB         = 6_000
+MEM_CRITICAL_MB        = 8_000
+MEM_LIMIT_MB           = 16_384
 
-# Memory
-MEMORY_CHECK_INTERVAL = 30       # seconds
-MEMORY_WARNING_MB = 6000         # early sync trigger
-MEMORY_CRITICAL_MB = 8000        # GC + sync
-MEMORY_LIMIT_MB = 16384          # Hugging Face Spaces free tier
+# KEY_COOLDOWN_BASE doubles each consecutive 429 (exponential back-off)
+KEY_COOLDOWN_BASE      = 2.0           # seconds
+KEY_COOLDOWN_MAX       = 60.0          # seconds
+# Jitter prevents all cooled-down keys hammering together (thundering herd)
+KEY_COOLDOWN_JITTER    = 1.0           # seconds (uniform random 0..KEY_COOLDOWN_JITTER)
+KEY_TIMEOUT            = (10, 300)     # (connect_s, read_s)
+# Maximum time to wait for the least-cold key before giving up immediately
+KEY_MAX_COOLDOWN_WAIT  = 5.0           # seconds
 
-# Key rotation
-KEY_COOLDOWN_BASE = 2.0          # seconds — base cooldown after 429
-KEY_COOLDOWN_MAX = 30.0          # seconds — max cooldown per key
-KEY_REQUEST_TIMEOUT = (10, 300)  # (connect, read) — 5 mins for heavy model cold-starts
+WATCHDOG_START_DELAY   = 45            # seconds – Telegram poll lock expiry
+WATCHDOG_MAX_RESTARTS  = 5             # within WATCHDOG_WINDOW
+WATCHDOG_WINDOW        = 600           # seconds
+WATCHDOG_BASE_DELAY    = 5             # restart backoff base (doubles each restart)
 
-# Hermes watchdog
-HERMES_STARTUP_DELAY = 45        # seconds — let old Telegram poll lock expire
-HERMES_MAX_RESTARTS = 5          # within HERMES_RESTART_WINDOW
-HERMES_RESTART_WINDOW = 600      # seconds (10 min)
-HERMES_RESTART_BASE_DELAY = 5    # seconds — base delay, doubles each restart
+KEEP_ALIVE_INTERVAL    = 240           # seconds
 
-# Boot timestamp
-BOOT_TIME = time.time()
+PORT      = int(os.environ.get("PORT", 8080))
+BOOT_MONO = time.monotonic()   # wall-clock-independent uptime reference
 
+# ══════════════════════════════════════════════════════════════
+#  SHARED HTTP SESSION  (connection-pooled, keep-alive)
+# ══════════════════════════════════════════════════════════════
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                  SUPABASE SYNC ENGINE                        ║
-# ║                                                              ║
-# ║  Syncs the ENTIRE ~/.hermes/ directory:                      ║
-# ║  state.db, skills/, memories/, SOUL.md, config.yaml,         ║
-# ║  auth.json, cron/, sessions/ — everything the agent creates  ║
-# ║                                                              ║
-# ║  Uses a manifest (_manifest.json) for incremental uploads:   ║
-# ║  only files whose mtime or size changed get re-uploaded.     ║
-# ╚══════════════════════════════════════════════════════════════╝
+# One session for all outbound calls (Supabase + NVIDIA + keep-alive).
+# max_retries=0 here because retry logic is implemented at a higher level.
+_http = requests.Session()
+_http.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=64, max_retries=0))
+_http.mount("http://",  HTTPAdapter(pool_connections=8,  pool_maxsize=32, max_retries=0))
 
-supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
-supabase_key = os.environ.get("SUPABASE_KEY")  # service_role key
-supabase_ready = bool(supabase_url and supabase_key)
+# ══════════════════════════════════════════════════════════════
+#  FLASK
+# ══════════════════════════════════════════════════════════════
 
-# Direct REST headers — no SDK needed, saves ~50 MB RAM
-_sb_headers = (
-    {"Authorization": f"Bearer {supabase_key}", "apikey": supabase_key}
-    if supabase_ready
-    else {}
+app = Flask(__name__)
+
+# ══════════════════════════════════════════════════════════════
+#  SHUTDOWN COORDINATION
+#  All threads check _shutdown_event.is_set() and exit cleanly.
+#  _graceful_shutdown() is idempotent — safe to call from multiple paths.
+# ══════════════════════════════════════════════════════════════
+
+_shutdown_event = threading.Event()
+_shutdown_lock  = threading.Lock()   # ensures _graceful_shutdown() runs exactly once
+_shutdown_done  = False
+
+# ══════════════════════════════════════════════════════════════
+#  SUPABASE SYNC ENGINE
+# ══════════════════════════════════════════════════════════════
+
+_sb_url  = os.environ.get("SUPABASE_URL", "").rstrip("/")
+_sb_key  = os.environ.get("SUPABASE_KEY", "")
+_sb_hdrs: dict[str, str] = (
+    {"Authorization": f"Bearer {_sb_key}", "apikey": _sb_key}
+    if (_sb_url and _sb_key) else {}
 )
+_sb_ok   = False  # confirmed True after _probe_supabase()
 
-sync_lock = threading.Lock()
-sync_manifest = {}  # rel_path -> {size, mtime, synced_at}
-sync_stats = {
-    "uploads": 0,
-    "downloads": 0,
-    "last_sync": None,
-    "errors": 0,
-    "files_synced": [],
+# Single lock guards both _sync_manifest and _sync_stats.
+# Never hold this lock while doing I/O — snapshot first, I/O second.
+_sync_lock     = threading.Lock()
+_sync_manifest: dict[str, dict] = {}
+_sync_stats: dict = {
+    "uploads":      0,
+    "downloads":    0,
+    "errors":       0,
+    "last_sync":    None,
+    "recent_files": deque(maxlen=10),   # thread-safe append, bounded
 }
 
-if supabase_ready:
-    # Verify connection with a quick HEAD request to the bucket
+
+def _probe_supabase() -> bool:
+    """Verify Supabase connectivity. Sets module-level _sb_ok."""
+    global _sb_ok
+    if not (_sb_url and _sb_key):
+        log.info("SYNC  Supabase not configured — SUPABASE_URL/KEY missing")
+        return False
     try:
-        r = http_requests.get(
-            f"{supabase_url}/storage/v1/bucket/{SUPABASE_BUCKET}",
-            headers=_sb_headers,
-            timeout=10,
+        r = _http.get(
+            f"{_sb_url}/storage/v1/bucket/{SUPABASE_BUCKET}",
+            headers=_sb_hdrs, timeout=10,
         )
-        if r.status_code == 200:
-            print("[SYNC] ✅ Supabase Storage connected (direct REST)", flush=True)
+        _sb_ok = r.status_code == 200
+        if _sb_ok:
+            log.info("SYNC  ✅ Supabase Storage connected")
         else:
-            print(f"[SYNC] ⚠️ Supabase bucket check: HTTP {r.status_code}", flush=True)
-    except Exception as e:
-        print(f"[SYNC] ❌ Supabase connection failed: {e}", flush=True)
-        supabase_ready = False
+            log.warning("SYNC  ⚠ Supabase bucket check: HTTP %s", r.status_code)
+    except Exception as exc:
+        log.error("SYNC  ❌ Supabase unreachable: %s", exc)
+        _sb_ok = False
+    return _sb_ok
 
 
-def _should_sync(rel_path: str) -> bool:
-    """Filter: skip transient files, keep everything else."""
-    p = Path(rel_path)
+# ── filter helpers ─────────────────────────────────────────────
+
+def _should_sync(rel: str) -> bool:
+    p = Path(rel)
     if any(part in SYNC_EXCLUDE_DIRS for part in p.parts):
         return False
     if p.suffix in SYNC_EXCLUDE_SUFFIXES:
         return False
-    if p.name.endswith("-wal") or p.name.endswith("-shm"):
+    if any(p.name.endswith(t) for t in SYNC_EXCLUDE_TAILS):
         return False
     return True
 
 
-def _get_local_files() -> dict:
-    """Walk ~/.hermes/ and return all syncable files with metadata."""
-    files = {}
-    for fpath in HERMES_HOME.rglob("*"):
-        if not fpath.is_file():
+def _local_files() -> dict[str, dict]:
+    """Enumerate syncable files under HERMES_HOME with size+mtime metadata."""
+    limit = MAX_SYNC_FILE_MB * 1_048_576
+    out: dict[str, dict] = {}
+    for fp in HERMES_HOME.rglob("*"):
+        if not fp.is_file():
             continue
-        rel = str(fpath.relative_to(HERMES_HOME))
+        rel = str(fp.relative_to(HERMES_HOME))
         if not _should_sync(rel):
             continue
-        stat = fpath.stat()
-        if stat.st_size > MAX_SYNC_FILE_SIZE_MB * 1024 * 1024:
+        try:
+            st = fp.stat()
+        except OSError:
             continue
-        files[rel] = {"size": stat.st_size, "mtime": stat.st_mtime}
-    return files
+        if st.st_size > limit:
+            continue
+        out[rel] = {"size": st.st_size, "mtime": st.st_mtime}
+    return out
 
 
-def _checkpoint_sqlite():
-    """Flush SQLite WAL so state.db is self-contained before upload."""
-    db_path = HERMES_HOME / "state.db"
-    if not db_path.exists():
-        return
+def _mime(rel: str) -> str:
+    """Best-effort MIME type for a relative path."""
+    t, _ = mimetypes.guess_type(rel)
+    if t:
+        return t
+    return {
+        ".yaml": "text/plain", ".yml": "text/plain",
+        ".md":   "text/plain", ".env": "text/plain",
+        ".json": "application/json",
+    }.get(Path(rel).suffix.lower(), "application/octet-stream")
+
+
+# ── low-level Supabase REST helpers ───────────────────────────
+
+def _sb_get(path: str, timeout: int = 30) -> requests.Response | None:
+    if not _sb_ok:
+        return None
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5)
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.close()
-    except Exception as e:
-        print(f"[SYNC] SQLite checkpoint warning: {e}", flush=True)
+        return _http.get(
+            f"{_sb_url}/storage/v1/object/{SUPABASE_BUCKET}/{path}",
+            headers=_sb_hdrs, timeout=timeout,
+        )
+    except Exception as exc:
+        log.warning("SYNC  GET %s: %s", path, exc)
+        return None
 
 
-def _download_one(rel_path: str) -> bool:
-    """Download a single file from Supabase Storage to ~/.hermes/."""
-    if not supabase_ready:
+def _sb_put(path: str, data: bytes, ct: str, timeout: int = 60) -> bool:
+    if not _sb_ok:
         return False
     try:
-        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/{rel_path}"
-        r = http_requests.get(url, headers=_sb_headers, timeout=30)
-        if r.status_code == 200:
-            local = HERMES_HOME / rel_path
-            local.parent.mkdir(parents=True, exist_ok=True)
-            local.write_bytes(r.content)
-            sync_stats["downloads"] += 1
+        hdrs = {**_sb_hdrs, "Content-Type": ct, "x-upsert": "true"}
+        r = _http.post(
+            f"{_sb_url}/storage/v1/object/{SUPABASE_BUCKET}/{path}",
+            headers=hdrs, data=data, timeout=timeout,
+        )
+        if r.status_code in (200, 201):
             return True
-        elif r.status_code == 404:
-            return False  # expected on first run
-        else:
-            print(f"[SYNC] Download failed: {rel_path} — HTTP {r.status_code}", flush=True)
-            sync_stats["errors"] += 1
-            return False
-    except Exception as e:
-        print(f"[SYNC] Download failed: {rel_path} — {e}", flush=True)
-        sync_stats["errors"] += 1
+        log.warning("SYNC  PUT %s: HTTP %s — %.200s", path, r.status_code, r.text)
+        return False
+    except Exception as exc:
+        log.warning("SYNC  PUT %s: %s", path, exc)
         return False
 
 
-def _upload_one(rel_path: str) -> bool:
-    """Upload a single file from ~/.hermes/ to Supabase Storage (upsert)."""
-    if not supabase_ready:
+# ── single-file operations ────────────────────────────────────
+
+def _download_one(rel: str) -> bool:
+    r = _sb_get(rel)
+    if r is None:
         return False
-    local = HERMES_HOME / rel_path
+    if r.status_code == 200:
+        dest = HERMES_HOME / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(r.content)
+        with _sync_lock:
+            _sync_stats["downloads"] += 1
+        return True
+    if r.status_code != 404:
+        log.warning("SYNC  download %s: HTTP %s", rel, r.status_code)
+        with _sync_lock:
+            _sync_stats["errors"] += 1
+    return False
+
+
+def _upload_one(rel: str) -> bool:
+    local = HERMES_HOME / rel
     if not local.exists():
         return False
-    try:
-        file_data = local.read_bytes()
-        # Guess content type
-        ct = "application/octet-stream"
-        if rel_path.endswith((".json", ".yaml", ".yml", ".md", ".txt", ".env")):
-            ct = "text/plain"
-
-        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/{rel_path}"
-        headers = {**_sb_headers, "Content-Type": ct, "x-upsert": "true"}
-        r = http_requests.post(url, headers=headers, data=file_data, timeout=30)
-        if r.status_code in (200, 201):
-            sync_stats["uploads"] += 1
-            return True
+    data = local.read_bytes()
+    # Scale timeout by file size: 60s base + 1s per MB
+    size_mb = len(data) / 1_048_576
+    timeout = int(60 + size_mb)
+    ok = _sb_put(rel, data, _mime(rel), timeout=timeout)
+    with _sync_lock:
+        if ok:
+            _sync_stats["uploads"] += 1
         else:
-            print(f"[SYNC] Upload failed: {rel_path} — HTTP {r.status_code}: {r.text[:200]}", flush=True)
-            sync_stats["errors"] += 1
-            return False
-    except Exception as e:
-        print(f"[SYNC] Upload failed: {rel_path} — {e}", flush=True)
-        sync_stats["errors"] += 1
-        return False
+            _sync_stats["errors"] += 1
+    return ok
 
+
+# ── manifest helpers ──────────────────────────────────────────
 
 def _load_manifest() -> dict:
-    """Download the sync manifest from Supabase."""
-    if not supabase_ready:
-        return {}
-    try:
-        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/_manifest.json"
-        r = http_requests.get(url, headers=_sb_headers, timeout=15)
-        if r.status_code == 200:
+    r = _sb_get("_manifest.json", timeout=15)
+    if r and r.status_code == 200:
+        try:
             return r.json()
-        return {}
-    except Exception:
-        return {}
+        except ValueError:
+            pass
+    return {}
 
 
-def _save_manifest():
-    """Upload the sync manifest to Supabase."""
-    if not supabase_ready:
+def _save_manifest() -> None:
+    with _sync_lock:
+        snapshot = dict(_sync_manifest)   # snapshot before I/O
+    data = json.dumps(snapshot, indent=2, default=str).encode()
+    _sb_put("_manifest.json", data, "application/json", timeout=15)
+
+
+def _wal_checkpoint() -> None:
+    """Flush SQLite WAL so state.db is self-contained before upload."""
+    db = HERMES_HOME / "state.db"
+    if not db.exists():
         return
     try:
-        data = json.dumps(sync_manifest, indent=2, default=str).encode("utf-8")
-        url = f"{supabase_url}/storage/v1/object/{SUPABASE_BUCKET}/_manifest.json"
-        headers = {**_sb_headers, "Content-Type": "application/json", "x-upsert": "true"}
-        r = http_requests.post(url, headers=headers, data=data, timeout=15)
-        if r.status_code not in (200, 201):
-            print(f"[SYNC] Manifest save failed: HTTP {r.status_code}", flush=True)
-    except Exception as e:
-        print(f"[SYNC] Manifest save failed: {e}", flush=True)
+        # timeout= is the connection-acquisition timeout, not query timeout.
+        conn = sqlite3.connect(str(db), timeout=10)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.warning("SYNC  WAL checkpoint warning: %s", exc)
 
 
-def sync_download_all():
-    """Restore full state from Supabase on startup.
+# ── high-level sync operations ────────────────────────────────
 
-    Downloads everything: state.db (conversations, memory, FTS indexes),
-    skills/ (learned + installed), memories/ (MEMORY.md, USER.md),
-    SOUL.md, auth.json, cron/, config.yaml, .env, and anything else
-    the agent previously created.
+def sync_download_all() -> None:
     """
-    global sync_manifest
-    if not supabase_ready:
+    Restore full state from Supabase.
+    Called once at startup before any background threads are running —
+    no locking needed on _sync_manifest here.
+    """
+    global _sync_manifest
+    if not _sb_ok:
         return
-
-    print("[SYNC] 📥 Restoring state from Supabase...", flush=True)
-    sync_manifest = _load_manifest()
-
-    if not sync_manifest:
-        print("[SYNC] No manifest found — first deployment or empty bucket", flush=True)
-        # Try legacy download of the 3 original files
+    log.info("SYNC  📥 Restoring state from Supabase...")
+    manifest = _load_manifest()
+    if not manifest:
+        log.info("SYNC  No manifest — first deployment or empty bucket")
         for f in ("state.db", "config.yaml", ".env"):
             if _download_one(f):
-                print(f"[SYNC]   ↳ legacy restore: {f}", flush=True)
+                log.info("SYNC    ↳ legacy: %s", f)
         return
 
-    ok, skip = 0, 0
-    categories = {}  # group by top-level dir for logging
-    for rel_path in sorted(sync_manifest.keys()):
-        if rel_path == "_manifest.json":
-            continue
-        if _download_one(rel_path):
+    _sync_manifest = {k: v for k, v in manifest.items() if k != "_manifest.json"}
+    ok = fail = 0
+    cats: dict[str, int] = {}
+    for rel in sorted(_sync_manifest):
+        if _download_one(rel):
             ok += 1
-            cat = rel_path.split("/")[0] if "/" in rel_path else "(root)"
-            categories[cat] = categories.get(cat, 0) + 1
+            cat = rel.split("/")[0] if "/" in rel else "(root)"
+            cats[cat] = cats.get(cat, 0) + 1
         else:
-            skip += 1
+            fail += 1
+    detail = ", ".join(f"{c}:{n}" for c, n in sorted(cats.items()))
+    log.info(
+        "SYNC  📥 Restored %d files (%d failures)%s",
+        ok, fail, f" — {detail}" if detail else "",
+    )
 
-    detail = ", ".join(f"{cat}: {n}" for cat, n in sorted(categories.items()))
-    print(f"[SYNC] 📥 Restored {ok} files ({skip} skipped)", flush=True)
-    if detail:
-        print(f"[SYNC]   ↳ {detail}", flush=True)
 
-
-def sync_upload_changed():
-    """Incremental sync — only upload files that changed since last sync.
-
-    Compares local mtimes/sizes against the manifest. Only changed files
-    are uploaded, minimizing Supabase bandwidth usage.
+def sync_upload_changed() -> None:
     """
-    global sync_manifest
-    with sync_lock:
-        if not supabase_ready:
-            return
+    Incremental sync — only files whose mtime or size changed since the
+    last upload.  Takes a manifest snapshot before doing any I/O so the
+    lock is never held across network calls.
+    """
+    if not _sb_ok:
+        return
+    _wal_checkpoint()
+    local = _local_files()
 
-        _checkpoint_sqlite()
-        local_files = _get_local_files()
-        uploaded = []
+    # Snapshot manifest while locked, then release before I/O
+    with _sync_lock:
+        prev = dict(_sync_manifest)
 
-        for rel_path, info in local_files.items():
-            prev = sync_manifest.get(rel_path, {})
-            if prev.get("mtime") == info["mtime"] and prev.get("size") == info["size"]:
-                continue  # unchanged
-            if _upload_one(rel_path):
-                sync_manifest[rel_path] = {
-                    "size": info["size"],
-                    "mtime": info["mtime"],
-                    "synced_at": datetime.now(timezone.utc).isoformat(),
-                }
-                uploaded.append(rel_path)
+    now_iso  = datetime.now(timezone.utc).isoformat()
+    uploaded: list[str] = []
 
-        if uploaded:
-            _save_manifest()
-            sync_stats["last_sync"] = datetime.now(timezone.utc).isoformat()
-            sync_stats["files_synced"] = uploaded[-10:]  # keep last 10
-            print(f"[SYNC] 📤 Synced {len(uploaded)} files: {', '.join(uploaded)}", flush=True)
+    for rel, info in local.items():
+        p = prev.get(rel, {})
+        if p.get("mtime") == info["mtime"] and p.get("size") == info["size"]:
+            continue  # unchanged
+        if _upload_one(rel):
+            entry = {**info, "synced_at": now_iso}
+            with _sync_lock:
+                _sync_manifest[rel] = entry
+            uploaded.append(rel)
 
-
-def sync_upload_all():
-    """Force-upload everything (used on shutdown)."""
-    global sync_manifest
-    with sync_lock:
-        if not supabase_ready:
-            return
-
-        _checkpoint_sqlite()
-        local_files = _get_local_files()
-        uploaded = 0
-
-        for rel_path, info in local_files.items():
-            if _upload_one(rel_path):
-                sync_manifest[rel_path] = {
-                    "size": info["size"],
-                    "mtime": info["mtime"],
-                    "synced_at": datetime.now(timezone.utc).isoformat(),
-                }
-                uploaded += 1
-
+    if uploaded:
         _save_manifest()
-        sync_stats["last_sync"] = datetime.now(timezone.utc).isoformat()
-        print(f"[SYNC] 📤 Full sync: {uploaded} files uploaded", flush=True)
+        with _sync_lock:
+            _sync_stats["last_sync"] = now_iso
+            _sync_stats["recent_files"].extend(uploaded)
+        log.info("SYNC  📤 Incremental: %d files", len(uploaded))
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                   NVIDIA KEY MANAGER                         ║
-# ║                                                              ║
-# ║  Adaptive rotation — no permanent blacklisting.              ║
-# ║  Per-key exponential cooldown on 429; transient retry on 403 ║
-# ║  Thread-safe with Lock.                                      ║
-# ╚══════════════════════════════════════════════════════════════╝
+def sync_upload_all() -> None:
+    """Force-upload every file (used on shutdown — correctness > speed)."""
+    if not _sb_ok:
+        return
+    _wal_checkpoint()
+    local    = _local_files()
+    now_iso  = datetime.now(timezone.utc).isoformat()
+    n        = 0
 
-nvidia_keys = []
-for i in range(1, 7):
-    val = os.environ.get(f"NVIDIA_NIM_KEY_{i}")
-    if val and val not in nvidia_keys:
-        nvidia_keys.append(val)
+    for rel, info in local.items():
+        if _upload_one(rel):
+            with _sync_lock:
+                _sync_manifest[rel] = {**info, "synced_at": now_iso}
+            n += 1
 
-# Fallback to standard NVIDIA_API_KEY environment variable
-api_key_val = os.environ.get("NVIDIA_API_KEY")
-if api_key_val and api_key_val not in nvidia_keys:
-    nvidia_keys.append(api_key_val)
+    _save_manifest()
+    with _sync_lock:
+        _sync_stats["last_sync"] = now_iso
+    log.info("SYNC  📤 Full sync: %d files", n)
 
-key_lock = threading.Lock()
-key_index = 0
-key_state = {}  # idx -> {cooldown_until, consecutive_429, consecutive_403, total_ok, total_fail, last_used}
 
-for i in range(len(nvidia_keys)):
-    key_state[i] = {
-        "cooldown_until": 0,
-        "consecutive_429": 0,
-        "consecutive_403": 0,
-        "total_ok": 0,
-        "total_fail": 0,
-        "last_used": 0,
-    }
+# ══════════════════════════════════════════════════════════════
+#  NVIDIA KEY MANAGER
+# ══════════════════════════════════════════════════════════════
 
-# Hermes probes these to detect backend type — they never exist on NVIDIA
-PROBE_PATHS = frozenset({"props", "version"})
+@dataclass
+class _KeyState:
+    cooldown_until:  float = 0.0    # monotonic timestamp
+    consecutive_429: int   = 0
+    consecutive_403: int   = 0
+    total_ok:        int   = 0
+    total_fail:      int   = 0
+    last_used:       float = field(default_factory=time.monotonic)
+
+    def ready(self) -> bool:
+        return time.monotonic() >= self.cooldown_until
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self.cooldown_until - time.monotonic())
+
+
+# Load all NVIDIA keys — deduplicate while preserving order
+_nvidia_keys: list[str] = []
+for _i in range(1, 7):
+    _v = os.environ.get(f"NVIDIA_NIM_KEY_{_i}", "")
+    if _v and _v not in _nvidia_keys:
+        _nvidia_keys.append(_v)
+_v = os.environ.get("NVIDIA_API_KEY", "")
+if _v and _v not in _nvidia_keys:
+    _nvidia_keys.append(_v)
+
+_key_lock  = threading.Lock()
+_key_state = [_KeyState() for _ in _nvidia_keys]
+_key_rr    = 0   # round-robin cursor (protected by _key_lock)
+
+# Paths the NVIDIA backend never serves — short-circuit them
+# to avoid wasting key quota on probe traffic from Hermes.
+_PROBE_PATHS = frozenset({"props", "version"})
 
 
 def _is_probe(path: str) -> bool:
-    """Return True for backend-detection probes that should be short-circuited."""
-    return path in PROBE_PATHS or path.startswith("api/")
+    return path in _PROBE_PATHS or path.startswith("api/")
 
 
-def get_next_key(exclude_indices=None):
-    """Thread-safe key selection with adaptive cooldown.
-
-    Returns (key_value, key_index) or (None, None) if all exhausted.
-    Never permanently disables a key — uses time-based cooldowns only.
+def get_next_key(exclude: set[int] | None = None) -> tuple[str | None, int | None]:
     """
-    global key_index
-    if exclude_indices is None:
-        exclude_indices = set()
+    Round-robin key selection.
+    Pass 1: return the first ready key (not on cooldown).
+    Pass 2: if all keys are on cooldown, return the one whose cooldown
+            expires soonest.  The caller is responsible for sleeping if
+            cooldown_remaining() > KEY_MAX_COOLDOWN_WAIT.
+    Returns (None, None) if no keys at all or all excluded.
+    """
+    global _key_rr
+    ex = exclude or set()
+    if not _nvidia_keys:
+        return None, None
 
-    with key_lock:
-        if not nvidia_keys:
+    with _key_lock:
+        n          = len(_nvidia_keys)
+        now        = time.monotonic()
+        candidates = [i for i in range(n) if i not in ex]
+        if not candidates:
             return None, None
-        n = len(nvidia_keys)
-        now = time.time()
 
-        eligible_indices = [i for i in range(n) if i not in exclude_indices]
-        if not eligible_indices:
-            return None, None
-
-        # Pass 1: find an eligible key that's off cooldown
+        # Pass 1 — ready keys
         for _ in range(n):
-            idx = key_index % n
-            key_index += 1
-            if idx in exclude_indices:
+            idx      = _key_rr % n
+            _key_rr += 1
+            if idx in ex:
                 continue
-            if now >= key_state[idx]["cooldown_until"]:
-                key_state[idx]["last_used"] = now
-                return nvidia_keys[idx], idx
+            if now >= _key_state[idx].cooldown_until:
+                _key_state[idx].last_used = now
+                return _nvidia_keys[idx], idx
 
-        # Pass 2: all eligible keys on cooldown — pick the one that's soonest available
-        soonest_idx = min(eligible_indices, key=lambda i: key_state[i]["cooldown_until"])
-        key_state[soonest_idx]["last_used"] = now
-        return nvidia_keys[soonest_idx], soonest_idx
+        # Pass 2 — all on cooldown; pick soonest
+        idx = min(candidates, key=lambda i: _key_state[i].cooldown_until)
+        _key_state[idx].last_used = now
+        return _nvidia_keys[idx], idx
 
 
-def report_key_result(idx: int, status_code: int, headers=None):
-    """Update per-key state based on API response."""
-    with key_lock:
-        s = key_state[idx]
-        now = time.time()
+def report_key_result(idx: int, status: int, resp_headers=None) -> None:
+    """Update per-key state after an upstream API call."""
+    now = time.monotonic()
+    with _key_lock:
+        s = _key_state[idx]
+        if 200 <= status < 300:
+            s.total_ok         += 1
+            s.consecutive_429   = 0
+            s.consecutive_403   = 0
+            s.cooldown_until    = 0.0
+            return
 
-        if 200 <= status_code < 300:
-            s["total_ok"] += 1
-            s["consecutive_429"] = 0
-            s["consecutive_403"] = 0
-            s["cooldown_until"] = 0
+        s.total_fail += 1
 
-        elif status_code == 429:
-            s["consecutive_429"] += 1
-            s["total_fail"] += 1
-
+        if status == 429:
+            s.consecutive_429 += 1
+            # Honour server-side Retry-After when present
             cooldown = None
-            if headers:
-                retry_after = headers.get("retry-after") or headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        cooldown = float(retry_after)
-                    except ValueError:
-                        pass
-            
+            if resp_headers:
+                for h in ("retry-after", "Retry-After", "x-ratelimit-reset-after"):
+                    v = (resp_headers.get(h) or "").strip()
+                    if v:
+                        try:
+                            cooldown = float(v)
+                            break
+                        except ValueError:
+                            pass
             if cooldown is None:
-                # Exponential cooldown: 2, 4, 8, 16... capped
                 cooldown = min(
-                    KEY_COOLDOWN_BASE * (2 ** (s["consecutive_429"] - 1)),
+                    KEY_COOLDOWN_BASE * (2 ** (s.consecutive_429 - 1)),
                     KEY_COOLDOWN_MAX,
                 )
-            
-            s["cooldown_until"] = now + cooldown
-            print(
-                f"[PROXY] Key #{idx+1} rate-limited (429) — "
-                f"cooldown {cooldown:.0f}s (streak {s['consecutive_429']})",
-                flush=True,
+            # Jitter prevents all keys hammering together after cooldown expires
+            jitter             = random.uniform(0.0, KEY_COOLDOWN_JITTER)
+            s.cooldown_until   = now + cooldown + jitter
+            log.warning(
+                "KEY   #%d → 429 cooldown %.1fs + %.1fj (streak %d)",
+                idx + 1, cooldown, jitter, s.consecutive_429,
             )
 
-        elif status_code == 403:
-            s["consecutive_403"] += 1
-            s["total_fail"] += 1
-            # Short cooldown — transient, not permanent
-            s["cooldown_until"] = now + 2.0
-            print(
-                f"[PROXY] Key #{idx+1} rejected (403) — "
-                f"cooldown 2s (streak {s['consecutive_403']})",
-                flush=True,
-            )
+        elif status == 403:
+            s.consecutive_403 += 1
+            s.cooldown_until   = now + 2.0
+            log.warning("KEY   #%d → 403 cooldown 2s (streak %d)", idx + 1, s.consecutive_403)
 
-        elif status_code == 401:
-            s["total_fail"] += 1
-            s["cooldown_until"] = now + 5.0
-            print(f"[PROXY] Key #{idx+1} unauthorized (401) — cooldown 5s", flush=True)
+        elif status == 401:
+            s.cooldown_until = now + 5.0
+            log.warning("KEY   #%d → 401 cooldown 5s", idx + 1)
 
-        elif status_code >= 500:
-            s["total_fail"] += 1
-            s["cooldown_until"] = now + 3.0
-            print(f"[PROXY] Key #{idx+1} server error ({status_code}) — cooldown 3s", flush=True)
+        elif status in (502, 504):
+            # Network-level errors — short cooldown, likely transient
+            s.cooldown_until = now + 2.0
+
+        elif status >= 500:
+            s.cooldown_until = now + 3.0
+            log.warning("KEY   #%d → server error %d cooldown 3s", idx + 1, status)
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                HERMES PROCESS MANAGER                        ║
-# ║                                                              ║
-# ║  Watchdog with auto-restart, exponential backoff,            ║
-# ║  process-group killing, and crash-loop detection.            ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ══════════════════════════════════════════════════════════════
+#  HERMES WATCHDOG
+# ══════════════════════════════════════════════════════════════
 
-hermes_proc = None
-hermes_lock = threading.Lock()
-hermes_restarts = []  # timestamps of recent restarts
-hermes_status = {
-    "state": "initializing",
-    "pid": None,
-    "started_at": None,
-    "restarts": 0,
-    "last_exit_code": None,
+_hermes_proc: subprocess.Popen | None = None
+_hermes_lock                           = threading.Lock()
+# _hermes_status is read from the health endpoint — needs its own lock
+_hermes_status_lock = threading.Lock()
+_hermes_status = {
+    "state": "initializing", "pid": None,
+    "started_at": None, "restarts": 0, "last_exit_code": None,
 }
+_hermes_restarts: deque[float] = deque()   # monotonic timestamps of recent crashes
 
 
-def _new_process_group():
-    """Create a new process group so we can kill all children on shutdown."""
+def _update_status(**kw) -> None:
+    with _hermes_status_lock:
+        _hermes_status.update(kw)
+
+
+def _setsid() -> None:
+    """Give the child process its own session so SIGTERM reaches the group."""
     try:
         os.setsid()
     except OSError:
         pass
 
 
-def _start_hermes(env_dict):
-    """Start the Hermes gateway subprocess."""
-    global hermes_proc
-    hermes_proc = subprocess.Popen(
+def _start_hermes(env: dict) -> None:
+    global _hermes_proc
+    _hermes_proc = subprocess.Popen(
         ["hermes", "gateway"],
-        env=env_dict,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        preexec_fn=_new_process_group,
+        preexec_fn=_setsid,
     )
-    hermes_status["pid"] = hermes_proc.pid
-    hermes_status["started_at"] = datetime.now(timezone.utc).isoformat()
-    hermes_status["state"] = "running"
-    print(f"[WATCHDOG] 🚀 Hermes started (PID {hermes_proc.pid})", flush=True)
+    _update_status(
+        state="running",
+        pid=_hermes_proc.pid,
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    log.info("WATCH 🚀 Hermes started (PID %d)", _hermes_proc.pid)
 
 
-def _kill_hermes():
-    """Kill the Hermes process and its entire process group."""
-    if hermes_proc is None or hermes_proc.poll() is not None:
+def _kill_hermes() -> None:
+    """Terminate the entire Hermes process group, SIGTERM then SIGKILL."""
+    with _hermes_lock:
+        proc = _hermes_proc
+    if proc is None or proc.poll() is not None:
         return
     try:
-        pgid = os.getpgid(hermes_proc.pid)
+        pgid = os.getpgid(proc.pid)
         os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        hermes_proc.terminate()
+    except (OSError, ProcessLookupError, PermissionError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
     try:
-        hermes_proc.wait(timeout=10)
+        proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         try:
-            pgid = os.getpgid(hermes_proc.pid)
+            pgid = os.getpgid(proc.pid)
             os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            hermes_proc.kill()
+        except (OSError, ProcessLookupError, PermissionError):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
 
-def run_hermes_watchdog(env_dict):
-    """Main watchdog loop — starts Hermes and auto-restarts on crash."""
-    global hermes_proc
+def run_hermes_watchdog(env: dict) -> None:
+    """
+    Main watchdog loop.  Starts Hermes and auto-restarts on crash.
+    Exits on:
+      • _shutdown_event being set
+      • clean exit (rc == 0)
+      • crash-loop detection (too many restarts)
+    """
+    global _hermes_proc
 
-    print(
-        f"[WATCHDOG] Waiting {HERMES_STARTUP_DELAY}s for "
-        f"Telegram polling lock to expire...",
-        flush=True,
-    )
-    hermes_status["state"] = "waiting"
-    time.sleep(HERMES_STARTUP_DELAY)
+    log.info("WATCH Waiting %ds for Telegram poll lock to expire...", WATCHDOG_START_DELAY)
+    _update_status(state="waiting")
+    # Wait using the shutdown event — exits early if shutdown is triggered
+    if _shutdown_event.wait(timeout=WATCHDOG_START_DELAY):
+        log.info("WATCH Shutdown signalled during startup delay — exiting")
+        return
 
-    while True:
-        # Check restart budget
-        now = time.time()
-        hermes_restarts[:] = [
-            t for t in hermes_restarts if now - t < HERMES_RESTART_WINDOW
-        ]
+    while not _shutdown_event.is_set():
+        # ── Crash-loop guard ────────────────────────────────────────
+        now = time.monotonic()
+        while _hermes_restarts and now - _hermes_restarts[0] > WATCHDOG_WINDOW:
+            _hermes_restarts.popleft()
 
-        if len(hermes_restarts) >= HERMES_MAX_RESTARTS:
-            hermes_status["state"] = "crash_loop"
-            print(
-                f"[WATCHDOG] ❌ Crash loop detected "
-                f"({HERMES_MAX_RESTARTS} restarts in {HERMES_RESTART_WINDOW}s). "
-                f"Hermes will NOT be restarted. Check logs.",
-                flush=True,
+        if len(_hermes_restarts) >= WATCHDOG_MAX_RESTARTS:
+            _update_status(state="crash_loop")
+            log.error(
+                "WATCH ❌ Crash loop: %d restarts in %ds — giving up. Check logs.",
+                WATCHDOG_MAX_RESTARTS, WATCHDOG_WINDOW,
             )
             sync_upload_changed()
             return
 
-        with hermes_lock:
-            _start_hermes(env_dict)
+        # ── Start process ───────────────────────────────────────────
+        with _hermes_lock:
+            _start_hermes(env)
+        proc = _hermes_proc
 
-        # Stream output (blocks until process exits)
-        if hermes_proc and hermes_proc.stdout:
-            for line in hermes_proc.stdout:
-                print(f"[HERMES] {line}", end="", flush=True)
+        # Stream stdout until the process exits or shutdown is requested
+        if proc and proc.stdout:
+            for line in proc.stdout:
+                if _shutdown_event.is_set():
+                    break
+                # Write directly to avoid logging overhead for every line
+                sys.stdout.write(f"[HERMES] {line}")
+                sys.stdout.flush()
 
-        rc = hermes_proc.wait() if hermes_proc else -1
-        hermes_status["state"] = "exited"
-        hermes_status["last_exit_code"] = rc
+        rc = proc.wait() if proc else -1
+        _update_status(state="exited", last_exit_code=rc)
 
-        if rc == 0:
-            print("[WATCHDOG] Hermes exited cleanly (code 0)", flush=True)
+        if _shutdown_event.is_set() or rc == 0:
+            log.info("WATCH Hermes exited (code %d)", rc)
             break
 
-        hermes_restarts.append(time.time())
-        hermes_status["restarts"] += 1
-        restart_num = len(hermes_restarts)
-        delay = min(HERMES_RESTART_BASE_DELAY * (2 ** (restart_num - 1)), 60)
-
-        exit_reason = "OOM killed" if rc == 137 else f"code {rc}"
-        print(
-            f"[WATCHDOG] ⚠️ Hermes crashed ({exit_reason}). "
-            f"Restart {restart_num}/{HERMES_MAX_RESTARTS} in {delay}s...",
-            flush=True,
+        # ── Restart with exponential back-off ───────────────────────
+        _hermes_restarts.append(time.monotonic())
+        n_restarts = len(_hermes_restarts)
+        _update_status(restarts=_hermes_status["restarts"] + 1)
+        delay   = min(WATCHDOG_BASE_DELAY * (2 ** (n_restarts - 1)), 60)
+        reason  = "OOM-killed" if rc in (-9, 137) else f"code {rc}"
+        log.warning(
+            "WATCH ⚠ Hermes crashed (%s) — restart %d/%d in %ds",
+            reason, n_restarts, WATCHDOG_MAX_RESTARTS, delay,
         )
-
-        # Save state before restart (in case next crash is an OOM SIGKILL)
         sync_upload_changed()
-        time.sleep(delay)
+        # Sleep respects shutdown — wakes immediately if shutdown fires
+        if _shutdown_event.wait(timeout=delay):
+            break
+
+    log.info("WATCH thread exiting")
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                    MEMORY MANAGER                            ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ══════════════════════════════════════════════════════════════
+#  MEMORY MONITOR
+# ══════════════════════════════════════════════════════════════
 
+def _rss_mb() -> float:
+    """
+    Combined RSS (proxy + Hermes agent) in megabytes via /proc/<pid>/statm.
+    Fails gracefully — returns 0.0 if /proc is unavailable.
+    """
+    page_bytes = os.sysconf("SC_PAGE_SIZE")
 
-def get_rss_mb() -> float:
-    """Get current RSS (not peak) in MB of both proxy and agent."""
-    total_rss = 0.0
-    
-    # 1. Proxy RSS
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-            total_rss += (pages * os.sysconf("SC_PAGE_SIZE")) / (1024 * 1024)
-    except Exception:
-        pass
-        
-    # 2. Agent RSS
-    global hermes_proc
-    if hermes_proc and hermes_proc.pid:
+    def _read(pid: int) -> float:
         try:
-            with open(f"/proc/{hermes_proc.pid}/statm") as f:
-                pages = int(f.read().split()[1])
-                total_rss += (pages * os.sysconf("SC_PAGE_SIZE")) / (1024 * 1024)
-        except Exception:
-            pass
-            
-    return total_rss
+            with open(f"/proc/{pid}/statm") as fh:
+                return int(fh.read().split()[1]) * page_bytes / 1_048_576
+        except OSError:
+            return 0.0
+
+    total = _read(os.getpid())
+    with _hermes_lock:
+        proc = _hermes_proc
+    if proc and proc.pid:
+        total += _read(proc.pid)
+    return total
 
 
-def memory_watchdog():
-    """Monitor RSS and take action when approaching OOM limits."""
-    early_synced = False
-    while True:
-        time.sleep(MEMORY_CHECK_INTERVAL)
-        rss = get_rss_mb()
-        uptime_min = (time.time() - BOOT_TIME) / 60
+def memory_watchdog() -> None:
+    warned = False
+    while not _shutdown_event.wait(timeout=MEM_CHECK_INTERVAL):
+        rss    = _rss_mb()
+        uptime = (time.monotonic() - BOOT_MONO) / 60
 
-        with key_lock:
-            now = time.time()
-            active_keys = sum(
-                1 for s in key_state.values() if now >= s["cooldown_until"]
-            )
-            total_ok = sum(s["total_ok"] for s in key_state.values())
-            total_fail = sum(s["total_fail"] for s in key_state.values())
+        with _key_lock:
+            now_m  = time.monotonic()
+            ready  = sum(1 for s in _key_state if now_m >= s.cooldown_until)
+            tot_ok = sum(s.total_ok   for s in _key_state)
+            tot_kf = sum(s.total_fail for s in _key_state)
 
-        print(
-            f"[MEM] {rss:.0f}/{MEMORY_LIMIT_MB} MB | "
-            f"Keys: {active_keys}/{len(nvidia_keys)} ready | "
-            f"API: {total_ok} ok / {total_fail} fail | "
-            f"Sync: ↑{sync_stats['uploads']} ↓{sync_stats['downloads']} | "
-            f"Up: {uptime_min:.0f}m",
-            flush=True,
+        with _sync_lock:
+            ups   = _sync_stats["uploads"]
+            downs = _sync_stats["downloads"]
+
+        log.info(
+            "MEM   %d/%d MB | keys %d/%d ready | api %d ok %d fail | "
+            "sync ↑%d ↓%d | up %.0fm",
+            int(rss), MEM_LIMIT_MB, ready, len(_nvidia_keys),
+            tot_ok, tot_kf, ups, downs, uptime,
         )
 
-        if rss > MEMORY_CRITICAL_MB:
-            print(
-                f"[MEM] 🔴 CRITICAL ({rss:.0f} MB) — forcing GC + sync",
-                flush=True,
-            )
+        if rss > MEM_CRITICAL_MB:
+            log.warning("MEM   🔴 CRITICAL %.0f MB — GC + sync", rss)
             gc.collect()
             sync_upload_changed()
-        elif rss > MEMORY_WARNING_MB and not early_synced:
-            early_synced = True
-            print(
-                f"[MEM] ⚠️ WARNING ({rss:.0f} MB) — early sync triggered",
-                flush=True,
-            )
+            warned = True
+        elif rss > MEM_WARNING_MB and not warned:
+            log.warning("MEM   ⚠ WARNING %.0f MB — early sync triggered", rss)
             sync_upload_changed()
-        elif rss <= MEMORY_WARNING_MB:
-            early_synced = False
+            warned = True
+        elif rss <= MEM_WARNING_MB:
+            warned = False
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                      FLASK ROUTES                            ║
-# ╚══════════════════════════════════════════════════════════════╝
+# ══════════════════════════════════════════════════════════════
+#  FLASK ROUTES
+# ══════════════════════════════════════════════════════════════
 
-port = int(os.environ.get("PORT", 8080))
+# Hop-by-hop headers must be stripped before forwarding.
+# We also strip encoding/length — the WSGI layer re-computes them.
+_HOP_BY_HOP = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+    "content-encoding", "content-length",
+})
 
 
 @app.route("/")
-def index():
-    return "Hermes Status: ONLINE", 200, {"Content-Type": "text/plain"}
+def index() -> Response:
+    return Response("Hermes Status: ONLINE\n", 200, {"Content-Type": "text/plain"})
 
 
 @app.route("/health")
-def health():
-    """Rich JSON health dashboard — memory, keys, sync, hermes status."""
-    rss = get_rss_mb()
-    uptime = time.time() - BOOT_TIME
-    now = time.time()
+def health() -> Response:
+    """Comprehensive, race-free JSON health dashboard."""
+    now    = time.monotonic()
+    rss    = _rss_mb()
+    uptime = now - BOOT_MONO
 
-    # Per-key detail
-    keys_detail = []
-    with key_lock:
-        for i in sorted(key_state.keys()):
-            s = key_state[i]
-            cd_left = max(0, s["cooldown_until"] - now)
-            keys_detail.append(
-                {
-                    "key": f"#{i+1}",
-                    "status": "ready" if cd_left == 0 else f"cooldown {cd_left:.0f}s",
-                    "ok": s["total_ok"],
-                    "fail": s["total_fail"],
-                    "streak_429": s["consecutive_429"],
-                    "streak_403": s["consecutive_403"],
-                }
-            )
-        active_keys = sum(1 for d in keys_detail if d["status"] == "ready")
+    # Snapshot key state under lock
+    with _key_lock:
+        keys_detail = []
+        for i, s in enumerate(_key_state):
+            cd = s.cooldown_remaining()
+            keys_detail.append({
+                "key":        f"#{i+1}",
+                "status":     "ready" if cd == 0.0 else f"cooldown {cd:.0f}s",
+                "ok":         s.total_ok,
+                "fail":       s.total_fail,
+                "streak_429": s.consecutive_429,
+                "streak_403": s.consecutive_403,
+            })
+        active = sum(1 for d in keys_detail if d["status"] == "ready")
 
-    # Sync detail — what files are being tracked
-    tracked_categories = {}
-    for rel_path in sync_manifest:
-        if rel_path == "_manifest.json":
+    # Snapshot sync state under lock
+    with _sync_lock:
+        sync_snap   = {k: v for k, v in _sync_stats.items() if k != "recent_files"}
+        recent      = list(_sync_stats["recent_files"])
+        mfst_snap   = dict(_sync_manifest)
+
+    cats: dict[str, int] = {}
+    for rel in mfst_snap:
+        if rel == "_manifest.json":
             continue
-        cat = rel_path.split("/")[0] if "/" in rel_path else "(root)"
-        tracked_categories[cat] = tracked_categories.get(cat, 0) + 1
+        cat = rel.split("/")[0] if "/" in rel else "(root)"
+        cats[cat] = cats.get(cat, 0) + 1
 
-    status = {
-        "status": "online",
-        "uptime_seconds": round(uptime),
-        "uptime_human": f"{uptime/3600:.1f}h",
-        "memory": {
-            "rss_mb": round(rss, 1),
-            "limit_mb": MEMORY_LIMIT_MB,
-            "usage_pct": round((rss / MEMORY_LIMIT_MB) * 100, 1)
-            if MEMORY_LIMIT_MB
-            else 0,
+    # Snapshot hermes status under lock
+    with _hermes_status_lock:
+        hermes_snap = dict(_hermes_status)
+
+    payload = {
+        "status":  "online",
+        "uptime":  {"seconds": round(uptime), "human": f"{uptime / 3600:.1f}h"},
+        "memory":  {
+            "rss_mb":    round(rss, 1),
+            "limit_mb":  MEM_LIMIT_MB,
+            "usage_pct": round(rss / MEM_LIMIT_MB * 100, 1),
         },
-        "hermes": hermes_status,
-        "nvidia_keys": {
-            "total": len(nvidia_keys),
-            "active": active_keys,
+        "hermes":  hermes_snap,
+        "keys":    {
+            "total":  len(_nvidia_keys),
+            "active": active,
             "detail": keys_detail,
         },
         "sync": {
-            "connected": supabase_ready,
-            "total_uploads": sync_stats["uploads"],
-            "total_downloads": sync_stats["downloads"],
-            "errors": sync_stats["errors"],
-            "last_sync": sync_stats["last_sync"],
-            "files_tracked": len(sync_manifest),
-            "categories": tracked_categories,
-            "recent_files": sync_stats.get("files_synced", []),
+            "connected":     _sb_ok,
+            **sync_snap,
+            "files_tracked": len(mfst_snap),
+            "categories":    cats,
+            "recent_files":  recent,
         },
     }
-    return json.dumps(status, indent=2, default=str), 200, {"Content-Type": "application/json"}
+    return Response(
+        json.dumps(payload, indent=2, default=str),
+        200, {"Content-Type": "application/json"},
+    )
 
 
-# --- Fallback routes for Ollama / misc backend probes ---
-# Hermes probes these on startup to detect what kind of API it's talking to.
-# Without these, they 404 and flood the logs.
+# ── Ollama / backend-probe stub routes ────────────────────────
+# Hermes probes these on startup to detect the backend type.
+# Without stubs they 404 and flood the logs.
 
 @app.route("/api/v1/models", methods=["GET"])
-@app.route("/api/tags", methods=["GET"])
-def ollama_models_fallback():
-    """Return an empty model list so Ollama-style probes don't 404."""
-    return json.dumps({"models": []}), 200, {"Content-Type": "application/json"}
+@app.route("/api/tags",      methods=["GET"])
+def _stub_models() -> Response:
+    return Response(json.dumps({"models": []}), 200, {"Content-Type": "application/json"})
 
 
 @app.route("/api/show", methods=["POST"])
-def ollama_show_fallback():
-    """Return a stub response for Ollama model-info probes."""
-    return json.dumps({"details": {"parent_model": ""}}), 200, {"Content-Type": "application/json"}
+def _stub_show() -> Response:
+    return Response(
+        json.dumps({"details": {"parent_model": ""}}),
+        200, {"Content-Type": "application/json"},
+    )
 
 
 @app.route("/v1/props", methods=["GET"])
-@app.route("/props", methods=["GET"])
-def props_fallback():
-    return json.dumps({}), 200, {"Content-Type": "application/json"}
+@app.route("/props",    methods=["GET"])
+def _stub_props() -> Response:
+    return Response("{}", 200, {"Content-Type": "application/json"})
 
 
 @app.route("/version", methods=["GET"])
-def version_fallback():
-    return json.dumps({"version": "proxy-1.0"}), 200, {"Content-Type": "application/json"}
+def _stub_version() -> Response:
+    return Response(json.dumps({"version": "proxy-1.0"}), 200, {"Content-Type": "application/json"})
 
 
-@app.route("/v1/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-def proxy(path):
-    """NVIDIA API proxy with adaptive key rotation and cooldowns."""
+# ── Main proxy ─────────────────────────────────────────────────
 
-    # Short-circuit backend detection probes — don't waste key rotations
+def _stream(resp: requests.Response, chunk_size: int | None = None) -> Generator[bytes, None, None]:
+    """
+    Yield chunks from a requests.Response and close it unconditionally.
+    Defined at module level so there is no closure variable to capture —
+    `resp` is passed by value as a default argument, making the binding
+    permanent and correct even if the caller's local variable is rebound.
+    """
+    try:
+        for chunk in resp.iter_content(chunk_size=chunk_size):
+            if chunk:
+                yield chunk
+    except Exception as exc:
+        log.debug("PROXY stream interrupted: %s", exc)
+    finally:
+        resp.close()
+
+
+@app.route(
+    "/v1/<path:path>",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+)
+def proxy(path: str) -> Response:
+    """NVIDIA NIM API reverse proxy with adaptive per-key rate-limit handling."""
+
+    # Backend detection probes — never forward, never waste key quota
     if _is_probe(path):
-        return "Not Found", 404
+        return Response("Not Found\n", 404)
 
-    if not nvidia_keys:
-        return "No NVIDIA keys configured", 500
+    if not _nvidia_keys:
+        return Response("No NVIDIA keys configured\n", 503)
 
-    target_url = f"https://integrate.api.nvidia.com/v1/{path}"
-    headers = {
-        k: v
-        for k, v in request.headers
-        if k.lower() not in ("host", "authorization")
+    if _shutdown_event.is_set():
+        return Response("Service shutting down — retry shortly\n", 503,
+                        {"Retry-After": "10"})
+
+    target  = f"https://integrate.api.nvidia.com/v1/{path}"
+    body    = flask_req.get_data()       # buffer once
+    method  = flask_req.method
+
+    # Forward headers — strip hop-by-hop and caller's auth header
+    fwd_headers = {
+        k: v for k, v in flask_req.headers
+        if k.lower() not in _HOP_BY_HOP and k.lower() != "authorization"
     }
-    excluded = frozenset(
-        {"content-encoding", "content-length", "transfer-encoding", "connection"}
-    )
 
-    max_attempts = len(nvidia_keys)
-    tried_indices = set()
-    last_resp = None
+    max_tries  = len(_nvidia_keys)
+    tried:     set[int] = set()
+    last_resp: requests.Response | None = None
 
-    for attempt in range(max_attempts):
-        key_val, idx = get_next_key(tried_indices)
-        if idx is None:
-            break
-        tried_indices.add(idx)
+    try:
+        for attempt in range(max_tries):
+            key_val, idx = get_next_key(tried)
+            if idx is None:
+                break
+            tried.add(idx)
 
-        headers["Authorization"] = f"Bearer {key_val}"
-        log_path = path.split("/")[-1]  # shorten for logging
-        print(
-            f"[PROXY] {attempt+1}/{max_attempts} → {log_path} (key #{idx+1})",
-            flush=True,
+            # If even the best available key is on long cooldown, fail fast
+            # and let the client retry with Retry-After semantics.
+            remaining = _key_state[idx].cooldown_remaining()
+            if remaining > KEY_MAX_COOLDOWN_WAIT:
+                log.warning(
+                    "PROXY all keys on cooldown (best: %.0fs remaining) — 503",
+                    remaining,
+                )
+                break
+            if remaining > 0:
+                time.sleep(remaining)
+
+            fwd_headers["Authorization"] = f"Bearer {key_val}"
+            log.info(
+                "PROXY %d/%d → %s (key #%d)",
+                attempt + 1, max_tries, path.rsplit("/", 1)[-1], idx + 1,
+            )
+
+            try:
+                resp = _http.request(
+                    method=method,
+                    url=target,
+                    headers=fwd_headers,
+                    data=body,
+                    cookies=flask_req.cookies,
+                    allow_redirects=False,
+                    stream=True,
+                    timeout=KEY_TIMEOUT,
+                )
+            except requests.Timeout:
+                log.warning("PROXY key #%d timed out", idx + 1)
+                report_key_result(idx, 504)
+                continue
+            except requests.ConnectionError as exc:
+                log.warning("PROXY connection error: %s", exc)
+                report_key_result(idx, 502)
+                continue
+
+            if resp.status_code in (401, 403, 429) or resp.status_code >= 500:
+                report_key_result(idx, resp.status_code, resp.headers)
+                # Close the failed response before trying the next key
+                if last_resp is not None:
+                    last_resp.close()
+                last_resp = resp
+                continue
+
+            # ── Success ─────────────────────────────────────────────
+            report_key_result(idx, resp.status_code, resp.headers)
+            if last_resp is not None:
+                last_resp.close()
+                last_resp = None
+
+            out_headers = [
+                (n, v) for n, v in resp.raw.headers.items()
+                if n.lower() not in _HOP_BY_HOP
+            ]
+            # Pass resp as a default arg — NOT a closure capture —
+            # so the binding survives loop exit / variable rebinding.
+            return Response(_stream(resp), resp.status_code, out_headers)
+
+        # ── All keys failed — forward the last upstream response ─────
+        if last_resp is not None:
+            out_headers = [
+                (n, v) for n, v in last_resp.raw.headers.items()
+                if n.lower() not in _HOP_BY_HOP
+            ]
+            _lr       = last_resp
+            last_resp = None          # prevent double-close in finally
+            return Response(_stream(_lr), _lr.status_code, out_headers)
+
+        min_cd = min(
+            (_key_state[i].cooldown_remaining() for i in range(len(_nvidia_keys))),
+            default=10.0,
+        )
+        return Response(
+            "All NVIDIA keys exhausted or on cooldown — retry shortly\n",
+            503, {"Retry-After": str(int(min_cd) + 1)},
         )
 
-        try:
-            resp = http_requests.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                data=request.get_data(),
-                cookies=request.cookies,
-                allow_redirects=False,
-                stream=True,
-                timeout=KEY_REQUEST_TIMEOUT,
-            )
-        except http_requests.Timeout:
-            print(
-                f"[PROXY] Key #{idx+1} timed out ({KEY_REQUEST_TIMEOUT}s)",
-                flush=True,
-            )
-            report_key_result(idx, 504)  # Put on cooldown
-            continue
-        except http_requests.ConnectionError as e:
-            print(f"[PROXY] Connection error: {e}", flush=True)
-            report_key_result(idx, 502)  # Put on cooldown
-            continue
-
-        if resp.status_code in (401, 403, 429) or resp.status_code >= 500:
-            report_key_result(idx, resp.status_code, resp.headers)
-            if last_resp:
-                last_resp.close()
-            last_resp = resp
-            continue
-
-        report_key_result(idx, resp.status_code, resp.headers)
-        if last_resp:
+    except Exception:
+        log.exception("PROXY unhandled exception")
+        return Response("Internal proxy error\n", 500)
+    finally:
+        # Guarantee cleanup of any response not consumed above
+        if last_resp is not None:
             last_resp.close()
 
-        resp_headers = [
-            (n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded
-        ]
 
-        def generate_success():
-            try:
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
-                        yield chunk
-            finally:
-                resp.close()
+# ══════════════════════════════════════════════════════════════
+#  GRACEFUL SHUTDOWN
+# ══════════════════════════════════════════════════════════════
 
-        return Response(generate_success(), resp.status_code, resp_headers, direct_passthrough=True)
+def _graceful_shutdown() -> None:
+    """
+    Idempotent shutdown sequence.
+    Called by:
+      • atexit (normal interpreter exit)
+      • _signal_handler (SIGTERM / SIGINT) via a daemon thread
+    The _shutdown_lock ensures the body runs at most once regardless
+    of how many signals arrive concurrently.
+    """
+    global _shutdown_done
+    with _shutdown_lock:
+        if _shutdown_done:
+            return
+        _shutdown_done = True
 
-    if last_resp:
-        resp_headers = [
-            (n, v) for n, v in last_resp.raw.headers.items() if n.lower() not in excluded
-        ]
-
-        def generate_failure():
-            try:
-                for chunk in last_resp.iter_content(chunk_size=None):
-                    if chunk:
-                        yield chunk
-            finally:
-                last_resp.close()
-
-        return Response(generate_failure(), last_resp.status_code, resp_headers, direct_passthrough=True)
-
-    return "All NVIDIA keys exhausted or on cooldown — try again shortly", 503
-
-
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                     SIGNAL HANDLERS                          ║
-# ╚══════════════════════════════════════════════════════════════╝
-
-
-def shutdown(signum, frame):
-    sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
-    print(f"[SHUTDOWN] Received {sig_name} — graceful shutdown...", flush=True)
+    _shutdown_event.set()   # wake all blocking waits in background threads
+    log.info("SHUTDOWN ▶ graceful shutdown initiated")
 
     _kill_hermes()
-    print("[SHUTDOWN] Hermes stopped", flush=True)
+    log.info("SHUTDOWN ✓ Hermes process group stopped")
 
-    if supabase_ready:
-        print("[SHUTDOWN] Saving ALL state to Supabase...", flush=True)
-        sync_upload_all()
-        print("[SHUTDOWN] ✅ State saved", flush=True)
-
-    sys.exit(0)
-
-
-signal.signal(signal.SIGTERM, shutdown)
-signal.signal(signal.SIGINT, shutdown)
+    if _sb_ok:
+        log.info("SHUTDOWN ▶ uploading final state to Supabase...")
+        try:
+            sync_upload_all()
+            log.info("SHUTDOWN ✓ state saved")
+        except Exception as exc:
+            log.error("SHUTDOWN ✗ state save failed: %s", exc)
 
 
-# ╔══════════════════════════════════════════════════════════════╗
-# ║                        STARTUP                               ║
-# ╚══════════════════════════════════════════════════════════════╝
+def _signal_handler(signum: int, _frame) -> None:
+    """
+    Signal handlers must be fast and non-blocking.
+    We schedule the real work on a daemon thread and arrange a
+    forced exit after a generous timeout so the process never hangs.
+    """
+    name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+    log.info("SIGNAL %s received", name)
 
-# --- 1. Restore state from Supabase FIRST (state.db, skills, memories, etc.) ---
+    # Run shutdown work off the signal-handling thread (avoids lock deadlocks)
+    threading.Thread(target=_graceful_shutdown, daemon=True, name="shutdown").start()
+
+    # Absolute safety net: if cleanup takes > 20s, force-exit.
+    def _force_exit() -> None:
+        time.sleep(20)
+        log.warning("SHUTDOWN forced exit after 20s timeout")
+        os._exit(0)
+
+    threading.Thread(target=_force_exit, daemon=True, name="force-exit").start()
+
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT,  _signal_handler)
+atexit.register(_graceful_shutdown)
+
+
+# ══════════════════════════════════════════════════════════════
+#  STARTUP SEQUENCE
+# ══════════════════════════════════════════════════════════════
+
+# ── 1. Verify Supabase (must complete before sync_download_all) ─
+_sb_ok = _probe_supabase()
+
+# ── 2. Restore persisted state ─────────────────────────────────
 sync_download_all()
 
-# --- 2. Write .env from Render env vars (always overwrites — env vars are source of truth) ---
-dotenv_lines = []
-telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-if telegram_token:
-    dotenv_lines.append(f"TELEGRAM_BOT_TOKEN={telegram_token}")
+# ── 3. Write .env from environment vars (always overwrites) ────
+def _write_dotenv() -> None:
+    """
+    Env vars are the authoritative source of secrets.
+    Writing them to .env lets Hermes pick them up via python-dotenv.
+    """
+    lines: list[str] = []
+    for var in (
+        "TELEGRAM_BOT_TOKEN",
+        *[f"NVIDIA_NIM_KEY_{i}" for i in range(1, 7)],
+        "HONCHO_API_KEY",
+        "EMAIL_ADDRESS", "EMAIL_PASSWORD",
+        "EMAIL_IMAP_HOST", "EMAIL_IMAP_PORT",
+        "EMAIL_SMTP_HOST", "EMAIL_SMTP_PORT",
+        "GITHUB_TOKEN", "GH_TOKEN",
+    ):
+        v = os.environ.get(var, "")
+        if v:
+            lines.append(f"{var}={v}")
+    lines.append("HERMES_AGENT_TIMEOUT=1800")
+    (HERMES_HOME / ".env").write_text("\n".join(lines) + "\n")
 
-for i in range(1, 7):
-    val = os.environ.get(f"NVIDIA_NIM_KEY_{i}")
-    if val:
-        dotenv_lines.append(f"NVIDIA_NIM_KEY_{i}={val}")
+    # Honcho sidecar config
+    if os.environ.get("HONCHO_API_KEY"):
+        honcho_dir = Path.home() / ".honcho"
+        honcho_dir.mkdir(parents=True, exist_ok=True)
+        cfg = honcho_dir / "config.json"
+        if not cfg.exists():
+            cfg.write_text(json.dumps({"enabled": True}))
 
-honcho_key = os.environ.get("HONCHO_API_KEY")
-if honcho_key:
-    dotenv_lines.append(f"HONCHO_API_KEY={honcho_key}")
-    honcho_dir = Path.home() / ".honcho"
-    honcho_dir.mkdir(parents=True, exist_ok=True)
-    honcho_config = honcho_dir / "config.json"
-    if not honcho_config.exists():
-        honcho_config.write_text(json.dumps({"enabled": True}))
 
-# Email and GitHub credentials
-for evar in (
-    "EMAIL_ADDRESS",
-    "EMAIL_PASSWORD",
-    "EMAIL_IMAP_HOST",
-    "EMAIL_IMAP_PORT",
-    "EMAIL_SMTP_HOST",
-    "EMAIL_SMTP_PORT",
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
-):
-    val = os.environ.get(evar)
-    if val:
-        dotenv_lines.append(f"{evar}={val}")
+_write_dotenv()
 
-# Agent gateway timeout — default 600s is too aggressive for complex tasks
-dotenv_lines.append("HERMES_AGENT_TIMEOUT=1800")
 
-(HERMES_HOME / ".env").write_text("\n".join(dotenv_lines) + "\n")
-
-# --- 3. Copy config.yaml from repo if not already present ---
-config_src = Path(__file__).parent / "config.yaml"
-config_dst = HERMES_HOME / "config.yaml"
-if config_src.exists() and not config_dst.exists():
-    config_dst.write_text(config_src.read_text())
-
-# Apply network/proxy overrides to config.yaml before starting Hermes
-if config_dst.exists():
+# ── 4. Init / patch config.yaml ────────────────────────────────
+def _init_config() -> None:
+    src = Path(__file__).parent / "config.yaml"
+    dst = HERMES_HOME / "config.yaml"
+    if src.exists() and not dst.exists():
+        dst.write_text(src.read_text())
+    if not dst.exists():
+        return
     try:
-        with open(config_dst, "r") as f:
-            cfg = yaml.safe_load(f) or {}
-            
-        # 1. Force IPv4 for python-telegram-bot to avoid AF_INET6 timeouts on Docker hosts
+        cfg = yaml.safe_load(dst.read_text()) or {}
         cfg.setdefault("network", {})["force_ipv4"] = True
-        
-        # 2. Inject Telegram Proxy URL if provided
-        tg_proxy = os.environ.get("TELEGRAM_API_URL")
+        cfg.setdefault("agent",   {})["gateway_timeout"] = 1800
+        tg_proxy = os.environ.get("TELEGRAM_API_URL", "").rstrip("/")
         if tg_proxy:
-            tg_proxy = tg_proxy.rstrip("/")
             if not tg_proxy.endswith("/bot"):
                 tg_proxy += "/bot"
             cfg.setdefault("telegram", {}).setdefault("extra", {})["base_url"] = tg_proxy
+        dst.write_text(yaml.dump(cfg, default_flow_style=False, allow_unicode=True))
+    except Exception as exc:
+        log.warning("BOOT config.yaml patch failed: %s", exc)
 
-        # 3. Extend gateway inactivity timeout (default 600s is too short)
-        cfg.setdefault("agent", {})["gateway_timeout"] = 1800
 
-        with open(config_dst, "w") as f:
-            yaml.dump(cfg, f)
-    except Exception as e:
-        print(f"[BOOT] Failed to modify config.yaml: {e}")
+_init_config()
 
-# --- 4. Build Hermes subprocess environment ---
-hermes_env = os.environ.copy()
-hermes_env["HERMES_HOME"] = str(HERMES_HOME)
-hermes_env["PYTHONUNBUFFERED"] = "1"
 
-proxy_url = f"http://127.0.0.1:{port}/v1"
-hermes_env["NVIDIA_BASE_URL"] = proxy_url
-hermes_env["NVIDIA_API_BASE"] = proxy_url
-hermes_env["OPENAI_BASE_URL"] = proxy_url
+# ── 5. Build Hermes subprocess environment ──────────────────────
+def _build_hermes_env() -> dict:
+    env = os.environ.copy()
+    env["HERMES_HOME"]      = str(HERMES_HOME)
+    env["PYTHONUNBUFFERED"] = "1"
+    proxy_base               = f"http://127.0.0.1:{PORT}/v1"
+    env["NVIDIA_BASE_URL"]  = proxy_base
+    env["NVIDIA_API_BASE"]  = proxy_base
+    env["OPENAI_BASE_URL"]  = proxy_base
+    if _nvidia_keys:
+        env.setdefault("NVIDIA_API_KEY", _nvidia_keys[0])
+    return env
 
-if "NVIDIA_NIM_KEY_1" in os.environ:
-    hermes_env.setdefault("NVIDIA_API_KEY", os.environ["NVIDIA_NIM_KEY_1"])
 
-# --- 5. Boot summary ---
-if os.environ.get("DATABASE_URL"):
-    print("[BOOT] Supabase PostgreSQL: Enabled", flush=True)
-else:
-    print("[BOOT] Supabase PostgreSQL: Not configured", flush=True)
+_hermes_env = _build_hermes_env()
 
-files_in_hermes = list(HERMES_HOME.rglob("*"))
-dirs_in_hermes = set()
-for f in files_in_hermes:
-    if f.is_file():
-        rel = f.relative_to(HERMES_HOME)
-        if len(rel.parts) > 1:
-            dirs_in_hermes.add(rel.parts[0])
 
-print(f"[BOOT] NVIDIA keys: {len(nvidia_keys)} loaded", flush=True)
-print(f"[BOOT] Hermes home: {HERMES_HOME}", flush=True)
-print(
-    f"[BOOT] State: {sum(1 for f in files_in_hermes if f.is_file())} files "
-    f"in {len(dirs_in_hermes)} directories",
-    flush=True,
-)
-if dirs_in_hermes:
-    print(f"[BOOT]   ↳ dirs: {', '.join(sorted(dirs_in_hermes))}", flush=True)
-print(
-    f"[BOOT] Sync interval: {SYNC_INTERVAL_SECS}s | "
-    f"Memory limit: {MEMORY_LIMIT_MB} MB | "
-    f"Watchdog: {HERMES_MAX_RESTARTS} max restarts",
-    flush=True,
-)
+# ── 6. Boot summary ─────────────────────────────────────────────
+def _boot_summary() -> None:
+    files = [f for f in HERMES_HOME.rglob("*") if f.is_file()]
+    dirs  = {
+        f.relative_to(HERMES_HOME).parts[0]
+        for f in files
+        if len(f.relative_to(HERMES_HOME).parts) > 1
+    }
+    log.info("BOOT  NVIDIA keys:   %d loaded", len(_nvidia_keys))
+    log.info("BOOT  Hermes home:   %s (%d files in %d dirs)", HERMES_HOME, len(files), len(dirs))
+    if dirs:
+        log.info("BOOT    ↳ dirs: %s", ", ".join(sorted(dirs)))
+    log.info(
+        "BOOT  Sync: %ds | Mem limit: %d MB | Watchdog: max %d restarts in %ds",
+        SYNC_INTERVAL_SECS, MEM_LIMIT_MB, WATCHDOG_MAX_RESTARTS, WATCHDOG_WINDOW,
+    )
+    log.info(
+        "BOOT  Supabase storage: %s | PostgreSQL: %s",
+        "✅" if _sb_ok else "❌",
+        "✅" if os.environ.get("DATABASE_URL") else "❌",
+    )
 
-# --- 6. Start background threads ---
 
-# Hermes watchdog (with auto-restart)
+_boot_summary()
+
+
+# ── 7. Launch background threads ────────────────────────────────
+
 threading.Thread(
     target=run_hermes_watchdog,
-    args=(hermes_env,),
+    args=(_hermes_env,),
     daemon=True,
     name="hermes-watchdog",
 ).start()
 
-# Periodic state sync
-if supabase_ready:
-
-    def _periodic_sync_loop():
-        while True:
-            time.sleep(SYNC_INTERVAL_SECS)
+if _sb_ok:
+    def _sync_loop() -> None:
+        while not _shutdown_event.wait(timeout=SYNC_INTERVAL_SECS):
             try:
                 sync_upload_changed()
-            except Exception as e:
-                print(f"[SYNC] Periodic sync error: {e}", flush=True)
+            except Exception as exc:
+                log.error("SYNC  periodic error: %s", exc)
+    threading.Thread(target=_sync_loop, daemon=True, name="periodic-sync").start()
+    log.info("BOOT  Periodic sync: every %ds", SYNC_INTERVAL_SECS)
 
-    threading.Thread(
-        target=_periodic_sync_loop, daemon=True, name="periodic-sync"
-    ).start()
-    print("[BOOT] Periodic sync: ON (every 10 min)", flush=True)
+threading.Thread(target=memory_watchdog, daemon=True, name="memory-monitor").start()
 
-# Memory monitor
-threading.Thread(
-    target=memory_watchdog, daemon=True, name="memory-monitor"
-).start()
 
-# --- Keep-alive self-ping (prevents HF Spaces from sleeping) ---
-KEEP_ALIVE_INTERVAL = 240  # seconds (4 minutes)
-
-def _keep_alive_loop():
-    """Ping our own public URL to prevent Hugging Face from sleeping the Space."""
-    hf_token = os.environ.get("HF_TOKEN", "")
-    space_host = os.environ.get("SPACE_HOST", "")  # e.g. "sidon1-hermes-agenta-slam.hf.space"
-
-    if not space_host:
-        print("[KEEPALIVE] ⚠ SPACE_HOST not set — self-ping disabled", flush=True)
+def _keep_alive_loop() -> None:
+    host  = os.environ.get("SPACE_HOST", "")
+    token = os.environ.get("HF_TOKEN", "")
+    if not host or not token:
+        log.info("KEEP  keep-alive disabled (SPACE_HOST or HF_TOKEN not set)")
         return
-    if not hf_token:
-        print("[KEEPALIVE] ⚠ HF_TOKEN not set — self-ping disabled (Space may sleep)", flush=True)
-        return
-
-    ping_url = f"https://{space_host}/"
-    headers = {"Authorization": f"Bearer {hf_token}"}
-    print(f"[KEEPALIVE] ✅ Self-ping enabled every {KEEP_ALIVE_INTERVAL}s → {ping_url}", flush=True)
-
-    while True:
-        time.sleep(KEEP_ALIVE_INTERVAL)
+    url  = f"https://{host}/"
+    hdrs = {"Authorization": f"Bearer {token}"}
+    log.info("KEEP  → %s every %ds", url, KEEP_ALIVE_INTERVAL)
+    while not _shutdown_event.wait(timeout=KEEP_ALIVE_INTERVAL):
         try:
-            r = http_requests.get(ping_url, headers=headers, timeout=15)
-            # Silently succeed — only log errors
+            r = _http.get(url, headers=hdrs, timeout=15)
             if r.status_code not in (200, 302):
-                print(f"[KEEPALIVE] ⚠ Ping returned HTTP {r.status_code}", flush=True)
-        except Exception as e:
-            print(f"[KEEPALIVE] ⚠ Ping failed: {e}", flush=True)
+                log.warning("KEEP  HTTP %s", r.status_code)
+        except Exception as exc:
+            log.warning("KEEP  ping failed: %s", exc)
 
-threading.Thread(
-    target=_keep_alive_loop, daemon=True, name="keep-alive"
-).start()
 
-print("[BOOT] ✅ All systems initialized — Hermes Agent is starting", flush=True)
+threading.Thread(target=_keep_alive_loop, daemon=True, name="keep-alive").start()
 
-# --- Entry point ---
+log.info("BOOT  ✅ All systems initialised — Hermes Agent is starting")
+
+# ══════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ══════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT, threaded=True)
