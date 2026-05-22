@@ -12,6 +12,7 @@ from pathlib import Path
 
 import requests as http_requests
 from flask import Flask, request, Response
+import yaml
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║                      CONFIGURATION                          ║
@@ -849,6 +850,25 @@ config_src = Path(__file__).parent / "config.yaml"
 config_dst = HERMES_HOME / "config.yaml"
 if config_src.exists() and not config_dst.exists():
     config_dst.write_text(config_src.read_text())
+
+# Apply network/proxy overrides to config.yaml before starting Hermes
+if config_dst.exists():
+    try:
+        with open(config_dst, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+            
+        # 1. Force IPv4 for python-telegram-bot to avoid AF_INET6 timeouts on Docker hosts
+        cfg.setdefault("network", {})["force_ipv4"] = True
+        
+        # 2. Inject Telegram Proxy URL if provided
+        tg_proxy = os.environ.get("TELEGRAM_API_URL")
+        if tg_proxy:
+            cfg.setdefault("telegram", {}).setdefault("extra", {})["base_url"] = tg_proxy.rstrip("/")
+            
+        with open(config_dst, "w") as f:
+            yaml.dump(cfg, f)
+    except Exception as e:
+        print(f"[BOOT] Failed to modify config.yaml: {e}")
 
 # --- 4. Build Hermes subprocess environment ---
 hermes_env = os.environ.copy()
