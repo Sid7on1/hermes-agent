@@ -1,5 +1,5 @@
 flask
-git+https://github.com/NousResearch/Hermes-Agent.git#egg=hermes-agent[messaging]
+hermes-agent[messaging] @ git+https://github.com/NousResearch/Hermes-Agent.git
 requests
 psycopg2-binary
 pillow
