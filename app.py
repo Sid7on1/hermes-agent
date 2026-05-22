@@ -949,6 +949,39 @@ threading.Thread(
     target=memory_watchdog, daemon=True, name="memory-monitor"
 ).start()
 
+# --- Keep-alive self-ping (prevents HF Spaces from sleeping) ---
+KEEP_ALIVE_INTERVAL = 240  # seconds (4 minutes)
+
+def _keep_alive_loop():
+    """Ping our own public URL to prevent Hugging Face from sleeping the Space."""
+    hf_token = os.environ.get("HF_TOKEN", "")
+    space_host = os.environ.get("SPACE_HOST", "")  # e.g. "sidon1-hermes-agenta-slam.hf.space"
+
+    if not space_host:
+        print("[KEEPALIVE] ⚠ SPACE_HOST not set — self-ping disabled", flush=True)
+        return
+    if not hf_token:
+        print("[KEEPALIVE] ⚠ HF_TOKEN not set — self-ping disabled (Space may sleep)", flush=True)
+        return
+
+    ping_url = f"https://{space_host}/"
+    headers = {"Authorization": f"Bearer {hf_token}"}
+    print(f"[KEEPALIVE] ✅ Self-ping enabled every {KEEP_ALIVE_INTERVAL}s → {ping_url}", flush=True)
+
+    while True:
+        time.sleep(KEEP_ALIVE_INTERVAL)
+        try:
+            r = http_requests.get(ping_url, headers=headers, timeout=15)
+            # Silently succeed — only log errors
+            if r.status_code not in (200, 302):
+                print(f"[KEEPALIVE] ⚠ Ping returned HTTP {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"[KEEPALIVE] ⚠ Ping failed: {e}", flush=True)
+
+threading.Thread(
+    target=_keep_alive_loop, daemon=True, name="keep-alive"
+).start()
+
 print("[BOOT] ✅ All systems initialized — Hermes Agent is starting", flush=True)
 
 # --- Entry point ---
