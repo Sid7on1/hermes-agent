@@ -1,3 +1,12 @@
+---
+title: Hermes Agent
+emoji: 🚀
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_file: app.py
+pinned: false
+---
 # Hermes Agent
 
 Production-grade deployment configuration for a background Telegram Agent with persistent memory and adaptive key rotation.
