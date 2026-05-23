@@ -1160,6 +1160,13 @@ def _init_config() -> None:
         return
     try:
         cfg = yaml.safe_load(dst.read_text()) or {}
+        
+        # Merge important fields from deployed src config to runtime dst config
+        if src.exists():
+            src_cfg = yaml.safe_load(src.read_text()) or {}
+            if "model" in src_cfg and "default" in src_cfg["model"]:
+                cfg.setdefault("model", {})["default"] = src_cfg["model"]["default"]
+                
         cfg.setdefault("network", {})["force_ipv4"] = True
         cfg.setdefault("agent",   {})["gateway_timeout"] = 1800
         tg_proxy = os.environ.get("TELEGRAM_API_URL", "").rstrip("/")
