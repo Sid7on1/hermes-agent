@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import concurrent.futures
 import time
 import queue
 from collections import deque
@@ -362,13 +363,19 @@ def sync_download_all() -> None:
     _sync_manifest = {k: v for k, v in manifest.items() if k != "_manifest.json"}
     ok = fail = 0
     cats: dict[str, int] = {}
-    for rel in sorted(_sync_manifest):
-        if _download_one(rel):
-            ok += 1
-            cat = rel.split("/")[0] if "/" in rel else "(root)"
-            cats[cat] = cats.get(cat, 0) + 1
-        else:
-            fail += 1
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_download_one, rel): rel for rel in _sync_manifest}
+        for future in concurrent.futures.as_completed(futures):
+            rel = futures[future]
+            success = future.result()
+            if success:
+                ok += 1
+                cat = rel.split("/")[0] if "/" in rel else "(root)"
+                cats[cat] = cats.get(cat, 0) + 1
+            else:
+                fail += 1
+                
     detail = ", ".join(f"{c}:{n}" for c, n in sorted(cats.items()))
     log.info(
         "SYNC  📥 Restored %d files (%d failures)%s",
@@ -397,15 +404,23 @@ def sync_upload_changed() -> None:
     now_iso  = datetime.now(timezone.utc).isoformat()
     uploaded: list[str] = []
 
+    to_upload = []
     for rel, info in local.items():
         p = prev.get(rel, {})
         if p.get("mtime") == info["mtime"] and p.get("size") == info["size"]:
             continue  # unchanged
-        if _upload_one(rel):
-            entry = {**info, "synced_at": now_iso}
-            with _sync_lock:
-                _sync_manifest[rel] = entry
-            uploaded.append(rel)
+        to_upload.append((rel, info))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_upload_one, rel): (rel, info) for rel, info in to_upload}
+        for future in concurrent.futures.as_completed(futures):
+            rel, info = futures[future]
+            success = future.result()
+            if success:
+                entry = {**info, "synced_at": now_iso}
+                with _sync_lock:
+                    _sync_manifest[rel] = entry
+                uploaded.append(rel)
 
     if uploaded:
         _save_manifest()
@@ -424,17 +439,61 @@ def sync_upload_all() -> None:
     now_iso  = datetime.now(timezone.utc).isoformat()
     n        = 0
 
-    for rel, info in local.items():
-        if _upload_one(rel):
-            with _sync_lock:
-                _sync_manifest[rel] = {**info, "synced_at": now_iso}
-            n += 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_upload_one, rel): (rel, info) for rel, info in local.items()}
+        for future in concurrent.futures.as_completed(futures):
+            rel, info = futures[future]
+            if future.result():
+                with _sync_lock:
+                    _sync_manifest[rel] = {**info, "synced_at": now_iso}
+                n += 1
 
     _save_manifest()
     with _sync_lock:
         _sync_stats["last_sync"] = now_iso
     log.info("SYNC  📤 Full sync: %d files", n)
 
+
+def _flush_telemetry() -> None:
+    """Post agent telemetry to Supabase agent_telemetry table."""
+    if not _sb_ok:
+        return
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        
+        # Aggregate key status
+        key_metrics = []
+        for i, st in enumerate(_key_state):
+            key_metrics.append({
+                "key_index": i + 1,
+                "total_ok": st.total_ok,
+                "total_fail": st.total_fail,
+                "consecutive_429": st.consecutive_429,
+                "consecutive_401": st.consecutive_401,
+                "consecutive_403": st.consecutive_403
+            })
+            
+        payload = {
+            "timestamp": now_iso,
+            "metrics": {
+                "keys": key_metrics,
+                "memory_mb": _rss_mb(),
+                "uptime_s": time.monotonic() - BOOT_MONO,
+                "hermes_restarts": _hermes_status["restarts"]
+            }
+        }
+        
+        hdrs = {**_sb_hdrs, "Content-Type": "application/json", "Prefer": "return=minimal"}
+        r = _http.post(
+            f"{_sb_url}/rest/v1/agent_telemetry",
+            headers=hdrs,
+            json=payload,
+            timeout=10
+        )
+        if r.status_code not in (200, 201):
+            log.debug("SYNC  Telemetry flush failed: HTTP %s", r.status_code)
+    except Exception as exc:
+        log.debug("SYNC  Telemetry flush error: %s", exc)
 
 # ══════════════════════════════════════════════════════════════
 #  NVIDIA KEY MANAGER
@@ -1251,6 +1310,7 @@ if _sb_ok:
         while not _shutdown_event.wait(timeout=SYNC_INTERVAL_SECS):
             try:
                 sync_upload_changed()
+                _flush_telemetry()
             except Exception as exc:
                 log.error("SYNC  periodic error: %s", exc)
     threading.Thread(target=_sync_loop, daemon=True, name="periodic-sync").start()
