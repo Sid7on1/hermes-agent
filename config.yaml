@@ -1,5 +1,5 @@
 model:
-  default: minimaxai/minimax-m2.7
+  default: z-ai/glm-5.1
   provider: nvidia
 
 nvidia:

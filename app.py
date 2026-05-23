@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+import queue
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -77,7 +78,7 @@ MAX_SYNC_FILE_MB       = 50
 SYNC_EXCLUDE_DIRS      = frozenset({"__pycache__", ".git", "cache", "sandbox", "tmp"})
 # Only real file-extension suffixes here — "-wal" / "-shm" are NOT extensions
 # and would never match Path.suffix. They are handled separately below.
-SYNC_EXCLUDE_SUFFIXES  = frozenset({".pyc", ".pyo", ".log", ".tmp"})
+SYNC_EXCLUDE_SUFFIXES  = frozenset({".pyc", ".pyo", ".log", ".tmp", ".env"})
 SYNC_EXCLUDE_TAILS     = ("-wal", "-shm")   # matched via str.endswith()
 
 MEM_CHECK_INTERVAL     = 30            # seconds
@@ -90,9 +91,9 @@ KEY_COOLDOWN_BASE      = 2.0           # seconds
 KEY_COOLDOWN_MAX       = 60.0          # seconds
 # Jitter prevents all cooled-down keys hammering together (thundering herd)
 KEY_COOLDOWN_JITTER    = 1.0           # seconds (uniform random 0..KEY_COOLDOWN_JITTER)
-KEY_TIMEOUT            = (10, 300)     # (connect_s, read_s)
+KEY_TIMEOUT            = (10, 900)     # (connect_s, read_s) increased to handle massive context cold-starts
 # Maximum time to wait for the least-cold key before giving up immediately
-KEY_MAX_COOLDOWN_WAIT  = 5.0           # seconds
+KEY_MAX_COOLDOWN_WAIT  = 0.5           # seconds (reduced to prevent blocking Flask thread)
 
 WATCHDOG_START_DELAY   = 45            # seconds – Telegram poll lock expiry
 WATCHDOG_MAX_RESTARTS  = 5             # within WATCHDOG_WINDOW
@@ -320,6 +321,7 @@ def _wal_checkpoint() -> None:
         # timeout= is the connection-acquisition timeout, not query timeout.
         conn = sqlite3.connect(str(db), timeout=10)
         try:
+            conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         finally:
             conn.close()
@@ -370,8 +372,11 @@ def sync_upload_changed() -> None:
     last upload.  Takes a manifest snapshot before doing any I/O so the
     lock is never held across network calls.
     """
+    global _sb_ok
     if not _sb_ok:
-        return
+        _sb_ok = _probe_supabase()
+        if not _sb_ok:
+            return
     _wal_checkpoint()
     local = _local_files()
 
@@ -430,6 +435,7 @@ class _KeyState:
     cooldown_until:  float = 0.0    # monotonic timestamp
     consecutive_429: int   = 0
     consecutive_403: int   = 0
+    consecutive_401: int   = 0
     total_ok:        int   = 0
     total_fail:      int   = 0
     last_used:       float = field(default_factory=time.monotonic)
@@ -461,7 +467,7 @@ _PROBE_PATHS = frozenset({"props", "version"})
 
 
 def _is_probe(path: str) -> bool:
-    return path in _PROBE_PATHS or path.startswith("api/")
+    return path in _PROBE_PATHS or path.startswith("api/") or path.startswith("v1/models")
 
 
 def get_next_key(exclude: set[int] | None = None) -> tuple[str | None, int | None]:
@@ -510,6 +516,7 @@ def report_key_result(idx: int, status: int, resp_headers=None) -> None:
             s.total_ok         += 1
             s.consecutive_429   = 0
             s.consecutive_403   = 0
+            s.consecutive_401   = 0
             s.cooldown_until    = 0.0
             return
 
@@ -547,8 +554,11 @@ def report_key_result(idx: int, status: int, resp_headers=None) -> None:
             log.warning("KEY   #%d → 403 cooldown 2s (streak %d)", idx + 1, s.consecutive_403)
 
         elif status == 401:
+            s.consecutive_401 += 1
             s.cooldown_until = now + 5.0
             log.warning("KEY   #%d → 401 cooldown 5s", idx + 1)
+            if all(st.consecutive_401 > 3 for st in _key_state):
+                log.critical("KEY   🚨 ALL KEYS REVOKED OR INVALID (401)")
 
         elif status in (502, 504):
             # Network-level errors — short cooldown, likely transient
@@ -762,9 +772,11 @@ def memory_watchdog() -> None:
         )
 
         if rss > MEM_CRITICAL_MB:
-            log.warning("MEM   🔴 CRITICAL %.0f MB — GC + sync", rss)
+            log.warning("MEM   🔴 CRITICAL %.0f MB — KILLING HERMES", rss)
+            with _hermes_lock:
+                if _hermes_proc and _hermes_proc.poll() is None:
+                    _hermes_proc.kill()
             gc.collect()
-            sync_upload_changed()
             warned = True
         elif rss > MEM_WARNING_MB and not warned:
             log.warning("MEM   ⚠ WARNING %.0f MB — early sync triggered", rss)
@@ -901,6 +913,8 @@ def _stream(resp: requests.Response, chunk_size: int | None = None) -> Generator
         for chunk in resp.iter_content(chunk_size=chunk_size):
             if chunk:
                 yield chunk
+    except requests.ConnectionError:
+        log.warning("PROXY upstream dropped mid-stream (connection error)")
     finally:
         resp.close()
 
