@@ -38,6 +38,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import queue
@@ -280,7 +281,16 @@ def _upload_one(rel: str) -> bool:
     local = HERMES_HOME / rel
     if not local.exists():
         return False
-    data = local.read_bytes()
+        
+    if rel == "state.db":
+        # Safe snapshotting to avoid WAL corruption during upload
+        with tempfile.NamedTemporaryFile() as tmp:
+            with sqlite3.connect(f"file:{local}?mode=ro", uri=True) as src, sqlite3.connect(tmp.name) as dst:
+                src.backup(dst)
+            data = Path(tmp.name).read_bytes()
+    else:
+        data = local.read_bytes()
+        
     # Scale timeout by file size: 60s base + 1s per MB
     size_mb = len(data) / 1_048_576
     timeout = int(60 + size_mb)
@@ -646,6 +656,8 @@ def _kill_hermes() -> None:
         except subprocess.TimeoutExpired:
             pass
 
+    # Ensure WAL is checkpointed so state.db is pristine after agent exits
+    _wal_checkpoint()
 
 def run_hermes_watchdog(env: dict) -> None:
     """
