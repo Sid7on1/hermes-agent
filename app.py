@@ -1292,6 +1292,11 @@ def _init_config() -> None:
                     k: v for k, v in src_cfg["telegram"].items()
                     if k in ("allowed_chats", "reactions", "extra")
                 })
+                # Bridge the legacy telegram.extra block into platforms.telegram.extra
+                if "extra" in src_cfg["telegram"]:
+                    cfg.setdefault("platforms", {}).setdefault("telegram", {}).setdefault("extra", {}).update(
+                        src_cfg["telegram"]["extra"]
+                    )
                 
         cfg.setdefault("network", {})["force_ipv4"] = True
         cfg.setdefault("agent",   {})["gateway_timeout"] = 1800
@@ -1299,7 +1304,8 @@ def _init_config() -> None:
         if tg_proxy:
             if not tg_proxy.endswith("/bot"):
                 tg_proxy += "/bot"
-            cfg.setdefault("telegram", {}).setdefault("extra", {})["base_url"] = tg_proxy
+            # Explicitly set the base_url in the location the gateway config parser looks for it
+            cfg.setdefault("platforms", {}).setdefault("telegram", {}).setdefault("extra", {})["base_url"] = tg_proxy
         dst.write_text(yaml.dump(cfg, default_flow_style=False, allow_unicode=True))
     except Exception as exc:
         log.warning("BOOT config.yaml patch failed: %s", exc)
