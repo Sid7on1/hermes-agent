@@ -49,10 +49,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator
 
-import requests
-from requests.adapters import HTTPAdapter
+import httpx
+import asyncio
+import uvicorn
+
 import yaml
-from flask import Flask, Response, request as flask_req
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 
 # ══════════════════════════════════════════════════════════════
 #  LOGGING
@@ -113,15 +116,14 @@ BOOT_MONO = time.monotonic()   # wall-clock-independent uptime reference
 
 # One session for all outbound calls (Supabase + NVIDIA + keep-alive).
 # max_retries=0 here because retry logic is implemented at a higher level.
-_http = requests.Session()
-_http.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=64, max_retries=0))
-_http.mount("http://",  HTTPAdapter(pool_connections=8,  pool_maxsize=32, max_retries=0))
+_http = httpx.Client(timeout=900.0)
+_async_client = None
 
 # ══════════════════════════════════════════════════════════════
 #  FLASK
 # ══════════════════════════════════════════════════════════════
 
-app = Flask(__name__)
+app = FastAPI()
 
 # ══════════════════════════════════════════════════════════════
 #  SHUTDOWN COORDINATION
@@ -227,7 +229,7 @@ def _mime(rel: str) -> str:
 
 # ── low-level Supabase REST helpers ───────────────────────────
 
-def _sb_get(path: str, timeout: int = 30) -> requests.Response | None:
+def _sb_get(path: str, timeout: int = 30) -> httpx.Response | None:
     if not _sb_ok:
         return None
     try:
@@ -858,31 +860,36 @@ def memory_watchdog() -> None:
 
 
 # ══════════════════════════════════════════════════════════════
-#  FLASK ROUTES
+#  FASTAPI ROUTES
 # ══════════════════════════════════════════════════════════════
 
-# Hop-by-hop headers must be stripped before forwarding.
-# We also strip encoding/length — the WSGI layer re-computes them.
 _HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
     "content-encoding", "content-length", "host"
 })
 
+@app.on_event("startup")
+async def startup_event():
+    global _async_client
+    _async_client = httpx.AsyncClient(timeout=900.0)
 
-@app.route("/")
-def index() -> Response:
-    return Response("Hermes Status: ONLINE\n", 200, {"Content-Type": "text/plain"})
+@app.on_event("shutdown")
+async def shutdown_event_handler():
+    global _async_client
+    if _async_client:
+        await _async_client.aclose()
 
+@app.get("/")
+async def index():
+    return PlainTextResponse("Hermes Status: ONLINE\n")
 
-@app.route("/health")
-def health() -> Response:
-    """Comprehensive, race-free JSON health dashboard."""
+@app.get("/health")
+async def health():
     now    = time.monotonic()
     rss    = _rss_mb()
     uptime = now - BOOT_MONO
 
-    # Snapshot key state under lock
     with _key_lock:
         keys_detail = []
         for i, s in enumerate(_key_state):
@@ -897,7 +904,6 @@ def health() -> Response:
             })
         active = sum(1 for d in keys_detail if d["status"] == "ready")
 
-    # Snapshot sync state under lock
     with _sync_lock:
         sync_snap   = {k: v for k, v in _sync_stats.items() if k != "recent_files"}
         recent      = list(_sync_stats["recent_files"])
@@ -910,7 +916,6 @@ def health() -> Response:
         cat = rel.split("/")[0] if "/" in rel else "(root)"
         cats[cat] = cats.get(cat, 0) + 1
 
-    # Snapshot hermes status under lock
     with _hermes_status_lock:
         hermes_snap = dict(_hermes_status)
 
@@ -936,91 +941,50 @@ def health() -> Response:
             "recent_files":  recent,
         },
     }
-    return Response(
-        json.dumps(payload, indent=2, default=str),
-        200, {"Content-Type": "application/json"},
-    )
+    return JSONResponse(payload)
+
+@app.get("/api/v1/models")
+@app.get("/api/tags")
+async def _stub_models():
+    return JSONResponse({"models": []})
+
+@app.post("/api/show")
+async def _stub_show():
+    return JSONResponse({"details": {"parent_model": ""}})
+
+@app.get("/v1/props")
+@app.get("/props")
+async def _stub_props():
+    return JSONResponse({})
+
+@app.get("/version")
+async def _stub_version():
+    return JSONResponse({"version": "proxy-1.0"})
 
 
-# ── Ollama / backend-probe stub routes ────────────────────────
-# Hermes probes these on startup to detect the backend type.
-# Without stubs they 404 and flood the logs.
-
-@app.route("/api/v1/models", methods=["GET"])
-@app.route("/api/tags",      methods=["GET"])
-def _stub_models() -> Response:
-    return Response(json.dumps({"models": []}), 200, {"Content-Type": "application/json"})
-
-
-@app.route("/api/show", methods=["POST"])
-def _stub_show() -> Response:
-    return Response(
-        json.dumps({"details": {"parent_model": ""}}),
-        200, {"Content-Type": "application/json"},
-    )
-
-
-@app.route("/v1/props", methods=["GET"])
-@app.route("/props",    methods=["GET"])
-def _stub_props() -> Response:
-    return Response("{}", 200, {"Content-Type": "application/json"})
-
-
-@app.route("/version", methods=["GET"])
-def _stub_version() -> Response:
-    return Response(json.dumps({"version": "proxy-1.0"}), 200, {"Content-Type": "application/json"})
-
-
-# ── Main proxy ─────────────────────────────────────────────────
-
-def _stream(resp: requests.Response, chunk_size: int | None = None) -> Generator[bytes, None, None]:
-    """
-    Yield chunks from a requests.Response and close it unconditionally.
-    Defined at module level so there is no closure variable to capture —
-    `resp` is passed by value as a default argument, making the binding
-    permanent and correct even if the caller's local variable is rebound.
-    """
-    try:
-        for chunk in resp.iter_content(chunk_size=chunk_size):
-            if chunk:
-                yield chunk
-    except requests.ConnectionError:
-        log.warning("PROXY upstream dropped mid-stream (connection error)")
-    finally:
-        resp.close()
-
-
-@app.route(
-    "/v1/<path:path>",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
-)
-def proxy(path: str) -> Response:
-    """NVIDIA NIM API reverse proxy with adaptive per-key rate-limit handling."""
-
-    # Backend detection probes — never forward, never waste key quota
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def proxy(path: str, request: Request):
     if _is_probe(path):
-        return Response("Not Found\n", 404)
+        return PlainTextResponse("Not Found\n", status_code=404)
 
     if not _nvidia_keys:
-        return Response("No NVIDIA keys configured\n", 503)
+        return PlainTextResponse("No NVIDIA keys configured\n", status_code=503)
 
     if _shutdown_event.is_set():
-        return Response("Service shutting down — retry shortly\n", 503,
-                        {"Retry-After": "10"})
+        return PlainTextResponse("Service shutting down — retry shortly\n", status_code=503, headers={"Retry-After": "10"})
 
-    target  = f"https://integrate.api.nvidia.com/v1/{path}"
-    body    = flask_req.get_data()       # buffer once
-    method  = flask_req.method
+    target = f"https://integrate.api.nvidia.com/v1/{path}"
+    body = await request.body()
+    method = request.method
 
-    # Forward headers — strip hop-by-hop and caller's auth header
     fwd_headers = {
-        k: v for k, v in flask_req.headers
+        k: v for k, v in request.headers.items()
         if k.lower() not in _HOP_BY_HOP and k.lower() != "authorization"
     }
 
-    max_tries  = len(_nvidia_keys)
-    tried:     set[int] = set()
-    last_resp: requests.Response | None = None
+    max_tries = len(_nvidia_keys)
+    tried = set()
+    last_resp = None
 
     try:
         for attempt in range(max_tries):
@@ -1029,92 +993,164 @@ def proxy(path: str) -> Response:
                 break
             tried.add(idx)
 
-            # If even the best available key is on long cooldown, fail fast
-            # and let the client retry with Retry-After semantics.
             remaining = _key_state[idx].cooldown_remaining()
             if remaining > KEY_MAX_COOLDOWN_WAIT:
-                log.warning(
-                    "PROXY all keys on cooldown (best: %.0fs remaining) — 503",
-                    remaining,
-                )
+                log.warning("PROXY all keys on cooldown (best: %.0fs remaining) — 503", remaining)
                 break
             if remaining > 0:
-                time.sleep(remaining)
+                await asyncio.sleep(remaining)
 
             fwd_headers["Authorization"] = f"Bearer {key_val}"
-            log.info(
-                "PROXY %d/%d → %s (key #%d)",
-                attempt + 1, max_tries, path.rsplit("/", 1)[-1], idx + 1,
+            log.info("PROXY %d/%d → %s (key #%d)", attempt + 1, max_tries, path.rsplit("/", 1)[-1], idx + 1)
+        
+            # Intercept and rewrite slow model payload to a faster one on the fly
+            try:
+                import json
+                payload = json.loads(body)
+                if payload.get("model") == "z-ai/glm-5.1":
+                    payload["model"] = "stepfun-ai/step-3.5-flash"
+                    body = json.dumps(payload).encode("utf-8")
+                    if "content-length" in fwd_headers:
+                        del fwd_headers["content-length"] # Let httpx recompute length
+            except Exception:
+                pass
+            
+            req = _async_client.build_request(
+                method=method,
+                url=target,
+                headers=fwd_headers,
+                content=body,
+                cookies=request.cookies
             )
 
             try:
-                resp = _http.request(
-                    method=method,
-                    url=target,
-                    headers=fwd_headers,
-                    data=body,
-                    cookies=flask_req.cookies,
-                    allow_redirects=False,
-                    stream=True,
-                    timeout=KEY_TIMEOUT,
-                )
-            except requests.Timeout:
+                resp = await _async_client.send(req, stream=True)
+            except httpx.TimeoutException:
                 log.warning("PROXY key #%d timed out", idx + 1)
                 report_key_result(idx, 504)
                 continue
-            except requests.ConnectionError as exc:
+            except httpx.RequestError as exc:
                 log.warning("PROXY connection error: %s", exc)
                 report_key_result(idx, 502)
                 continue
 
             if resp.status_code in (401, 403, 429) or resp.status_code >= 500:
                 report_key_result(idx, resp.status_code, resp.headers)
-                # Close the failed response before trying the next key
                 if last_resp is not None:
-                    last_resp.close()
+                    await last_resp.aclose()
                 last_resp = resp
                 continue
 
-            # ── Success ─────────────────────────────────────────────
             report_key_result(idx, resp.status_code, resp.headers)
             if last_resp is not None:
-                last_resp.close()
+                await last_resp.aclose()
                 last_resp = None
 
-            out_headers = [
-                (n, v) for n, v in resp.raw.headers.items()
+            out_headers = {
+                n: v for n, v in resp.headers.items()
                 if n.lower() not in _HOP_BY_HOP
-            ]
-            # Pass resp as a default arg — NOT a closure capture —
-            # so the binding survives loop exit / variable rebinding.
-            return Response(_stream(resp), resp.status_code, out_headers)
+            }
 
-        # ── All keys failed — forward the last upstream response ─────
+            # --- TELEMETRY TRACKING SETUP ---
+            import json, time, os
+            from datetime import datetime
+            
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {}
+                
+            req_start_time = time.time()
+            # --------------------------------
+
+            async def _stream(response):
+                ttfb = None
+                full_response = []
+                try:
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            if ttfb is None:
+                                ttfb = time.time() - req_start_time
+                            full_response.append(chunk)
+                            yield chunk
+                except httpx.RequestError:
+                    log.warning("PROXY upstream dropped mid-stream (connection error)")
+                finally:
+                    total_time = time.time() - req_start_time
+                    await response.aclose()
+                    
+                    # --- TELEMETRY LOGGING ---
+                    try:
+                        raw_resp = b"".join(full_response).decode('utf-8', errors='ignore')
+                        prompt_tokens = 0
+                        completion_tokens = 0
+                        
+                        # Extract usage tokens from final chunks if present
+                        for line in raw_resp.strip().split('\n'):
+                            if line.startswith('data: ') and line != 'data: [DONE]':
+                                try:
+                                    data = json.loads(line[6:])
+                                    if 'usage' in data and data['usage']:
+                                        prompt_tokens = data['usage'].get('prompt_tokens', prompt_tokens)
+                                        completion_tokens = data['usage'].get('completion_tokens', completion_tokens)
+                                except Exception:
+                                    pass
+                                    
+                        telemetry = {
+                            "timestamp": datetime.now().isoformat(),
+                            "model": payload.get("model", "unknown"),
+                            "ttfb_ms": round(ttfb * 1000) if ttfb else None,
+                            "total_time_ms": round(total_time * 1000),
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "request_payload": payload,
+                            "response_chunks": raw_resp
+                        }
+                        
+                        log_dir = os.path.expanduser("~/.hermes/logs")
+                        os.makedirs(log_dir, exist_ok=True)
+                        with open(os.path.join(log_dir, "api_telemetry.jsonl"), "a") as f:
+                            f.write(json.dumps(telemetry) + "\n")
+                    except Exception as e:
+                        log.error("Failed to write telemetry: %s", e)
+                    # -------------------------
+
+            return StreamingResponse(_stream(resp), status_code=resp.status_code, headers=out_headers)
+
         if last_resp is not None:
-            out_headers = [
-                (n, v) for n, v in last_resp.raw.headers.items()
+            out_headers = {
+                n: v for n, v in last_resp.headers.items()
                 if n.lower() not in _HOP_BY_HOP
-            ]
-            _lr       = last_resp
-            last_resp = None          # prevent double-close in finally
-            return Response(_stream(_lr), _lr.status_code, out_headers)
+            }
+            _lr = last_resp
+            last_resp = None
 
-        min_cd = min(
-            (_key_state[i].cooldown_remaining() for i in range(len(_nvidia_keys))),
-            default=10.0,
-        )
-        return Response(
-            "All NVIDIA keys exhausted or on cooldown — retry shortly\n",
-            503, {"Retry-After": str(int(min_cd) + 1)},
-        )
+            async def _stream_last(response):
+                try:
+                    async for chunk in response.aiter_bytes():
+                        if chunk:
+                            yield chunk
+                except httpx.RequestError:
+                    pass
+                finally:
+                    await response.aclose()
+
+            return StreamingResponse(_stream_last(_lr), status_code=_lr.status_code, headers=out_headers)
+
+        min_cd = min((_key_state[i].cooldown_remaining() for i in range(len(_nvidia_keys))), default=10.0)
+        return PlainTextResponse("All NVIDIA keys exhausted or on cooldown — retry shortly\n", status_code=503, headers={"Retry-After": str(int(min_cd) + 1)})
 
     except Exception:
         log.exception("PROXY unhandled exception")
-        return Response("Internal proxy error\n", 500)
+        return PlainTextResponse("Internal proxy error\n", status_code=500)
     finally:
-        # Guarantee cleanup of any response not consumed above
         if last_resp is not None:
-            last_resp.close()
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(last_resp.aclose())
+            except RuntimeError:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1346,4 +1382,5 @@ log.info("BOOT  ✅ All systems initialised — Hermes Agent is starting")
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning")

@@ -4,3 +4,8 @@ __pycache__/
 venv/
 
 nous_hermes_agent/
+
+.DS_Store
+.env.local
+.venv/
+
