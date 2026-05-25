@@ -1290,7 +1290,7 @@ def _init_config() -> None:
             if "telegram" in src_cfg:
                 cfg.setdefault("telegram", {}).update({
                     k: v for k, v in src_cfg["telegram"].items()
-                    if k in ("allowed_chats", "reactions")
+                    if k in ("allowed_chats", "reactions", "extra")
                 })
                 
         cfg.setdefault("network", {})["force_ipv4"] = True
