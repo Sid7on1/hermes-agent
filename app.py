@@ -1323,7 +1323,11 @@ def _build_hermes_env() -> dict:
     env["NVIDIA_BASE_URL"]  = proxy_base
     env["NVIDIA_API_BASE"]  = proxy_base
     env["OPENAI_BASE_URL"]  = proxy_base
-    if _nvidia_keys:
+    proxy_auth = os.environ.get("PROXY_API_KEY")
+    if proxy_auth:
+        env["NVIDIA_API_KEY"] = proxy_auth
+        env["OPENAI_API_KEY"] = proxy_auth
+    elif _nvidia_keys:
         env.setdefault("NVIDIA_API_KEY", _nvidia_keys[0])
         
     try:
