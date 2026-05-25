@@ -1319,6 +1319,16 @@ def _build_hermes_env() -> dict:
     env["OPENAI_BASE_URL"]  = proxy_base
     if _nvidia_keys:
         env.setdefault("NVIDIA_API_KEY", _nvidia_keys[0])
+        
+    try:
+        # Guarantee the hermes agent process sees the proxy via env var
+        cfg = yaml.safe_load((HERMES_HOME / "config.yaml").read_text()) or {}
+        base_url = cfg.get("telegram", {}).get("extra", {}).get("base_url")
+        if base_url:
+            env["TELEGRAM_API_URL"] = base_url
+    except Exception as e:
+        log.warning("Failed to extract TELEGRAM_API_URL for hermes env: %s", e)
+        
     return env
 
 
