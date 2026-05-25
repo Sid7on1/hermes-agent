@@ -1005,11 +1005,10 @@ async def proxy(path: str, request: Request):
         
             # Intercept and rewrite slow model payload to a faster one on the fly
             try:
-                import json
-                payload = json.loads(body)
-                if payload.get("model") == "z-ai/glm-5.1":
-                    payload["model"] = "stepfun-ai/step-3.5-flash"
-                    body = json.dumps(payload).encode("utf-8")
+                req_payload = json.loads(body)
+                if req_payload.get("model") == "z-ai/glm-5.1":
+                    req_payload["model"] = "stepfun-ai/step-3.5-flash"
+                    body = json.dumps(req_payload).encode("utf-8")
                     if "content-length" in fwd_headers:
                         del fwd_headers["content-length"] # Let httpx recompute length
             except Exception:
@@ -1052,8 +1051,6 @@ async def proxy(path: str, request: Request):
             }
 
             # --- TELEMETRY TRACKING SETUP ---
-            import json, time, os
-            from datetime import datetime
             
             try:
                 payload = json.loads(body)
@@ -1234,6 +1231,7 @@ def _write_dotenv() -> None:
         "TELEGRAM_BOT_TOKEN",
         *[f"NVIDIA_NIM_KEY_{i}" for i in range(1, 7)],
         "HONCHO_API_KEY",
+        "RESEND_API_KEY",
         "EMAIL_ADDRESS", "EMAIL_PASSWORD",
         "EMAIL_IMAP_HOST", "EMAIL_IMAP_PORT",
         "EMAIL_SMTP_HOST", "EMAIL_SMTP_PORT",
@@ -1273,6 +1271,12 @@ def _init_config() -> None:
             src_cfg = yaml.safe_load(src.read_text()) or {}
             if "model" in src_cfg and "default" in src_cfg["model"]:
                 cfg.setdefault("model", {})["default"] = src_cfg["model"]["default"]
+            # Always enforce telegram whitelist from the deployed config
+            if "telegram" in src_cfg:
+                cfg.setdefault("telegram", {}).update({
+                    k: v for k, v in src_cfg["telegram"].items()
+                    if k in ("allowed_chats", "reactions")
+                })
                 
         cfg.setdefault("network", {})["force_ipv4"] = True
         cfg.setdefault("agent",   {})["gateway_timeout"] = 1800
