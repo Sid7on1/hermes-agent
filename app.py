@@ -967,13 +967,16 @@ async def proxy(path: str, request: Request):
     if _is_probe(path):
         return PlainTextResponse("Not Found\n", status_code=404)
         
-    # Proxy Auth Protection
+    # Proxy Auth Protection — skip for internal (localhost) requests
     proxy_auth = os.environ.get("PROXY_API_KEY")
     if proxy_auth:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header != f"Bearer {proxy_auth}":
-            log.warning("PROXY unauthorized access attempt denied")
-            return PlainTextResponse("Unauthorized\n", status_code=401)
+        client_ip = request.client.host if request.client else ""
+        is_local = client_ip in ("127.0.0.1", "::1", "localhost")
+        if not is_local:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header != f"Bearer {proxy_auth}":
+                log.warning("PROXY unauthorized access attempt from %s denied", client_ip)
+                return PlainTextResponse("Unauthorized\n", status_code=401)
 
     if not _nvidia_keys:
         return PlainTextResponse("No NVIDIA keys configured\n", status_code=503)
@@ -1323,15 +1326,7 @@ def _build_hermes_env() -> dict:
     env["NVIDIA_BASE_URL"]  = proxy_base
     env["NVIDIA_API_BASE"]  = proxy_base
     env["OPENAI_BASE_URL"]  = proxy_base
-    proxy_auth = os.environ.get("PROXY_API_KEY")
-    if proxy_auth:
-        env["NVIDIA_API_KEY"] = proxy_auth
-        env["OPENAI_API_KEY"] = proxy_auth
-        # The agent reads specific keys based on its config; overwrite them so it bypasses proxy auth.
-        for i in range(1, 7):
-            if f"NVIDIA_NIM_KEY_{i}" in env:
-                env[f"NVIDIA_NIM_KEY_{i}"] = proxy_auth
-    elif _nvidia_keys:
+    if _nvidia_keys:
         env.setdefault("NVIDIA_API_KEY", _nvidia_keys[0])
         
     try:
