@@ -21,3 +21,7 @@ security:
 
 terminal:
   backend: local
+
+telegram:
+  allowed_chats: '6557201395'
+  reactions: false
