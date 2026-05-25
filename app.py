@@ -1290,7 +1290,7 @@ def _init_config() -> None:
             if "telegram" in src_cfg:
                 cfg.setdefault("telegram", {}).update({
                     k: v for k, v in src_cfg["telegram"].items()
-                    if k in ("allowed_chats", "reactions", "extra")
+                    if k in ("allowed_chats", "reactions", "extra", "allow_from")
                 })
                 # Bridge the legacy telegram.extra block into platforms.telegram.extra
                 if "extra" in src_cfg["telegram"]:

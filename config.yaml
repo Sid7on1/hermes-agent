@@ -24,6 +24,7 @@ terminal:
 
 telegram:
   allowed_chats: '6557201395'
+  allow_from: '6557201395'
   reactions: false
   extra:
     base_url: https://telegram-proxy.sid7vish.workers.dev/bot
