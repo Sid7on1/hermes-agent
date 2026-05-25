@@ -1327,6 +1327,10 @@ def _build_hermes_env() -> dict:
     if proxy_auth:
         env["NVIDIA_API_KEY"] = proxy_auth
         env["OPENAI_API_KEY"] = proxy_auth
+        # The agent reads specific keys based on its config; overwrite them so it bypasses proxy auth.
+        for i in range(1, 7):
+            if f"NVIDIA_NIM_KEY_{i}" in env:
+                env[f"NVIDIA_NIM_KEY_{i}"] = proxy_auth
     elif _nvidia_keys:
         env.setdefault("NVIDIA_API_KEY", _nvidia_keys[0])
         
