@@ -966,6 +966,14 @@ async def _stub_version():
 async def proxy(path: str, request: Request):
     if _is_probe(path):
         return PlainTextResponse("Not Found\n", status_code=404)
+        
+    # Proxy Auth Protection
+    proxy_auth = os.environ.get("PROXY_API_KEY")
+    if proxy_auth:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {proxy_auth}":
+            log.warning("PROXY unauthorized access attempt denied")
+            return PlainTextResponse("Unauthorized\n", status_code=401)
 
     if not _nvidia_keys:
         return PlainTextResponse("No NVIDIA keys configured\n", status_code=503)
@@ -1106,7 +1114,13 @@ async def proxy(path: str, request: Request):
                         
                         log_dir = os.path.expanduser("~/.hermes/logs")
                         os.makedirs(log_dir, exist_ok=True)
-                        with open(os.path.join(log_dir, "api_telemetry.jsonl"), "a") as f:
+                        log_file = os.path.join(log_dir, "api_telemetry.jsonl")
+                        
+                        # Rotate log if > 5MB
+                        if os.path.exists(log_file) and os.path.getsize(log_file) > 5 * 1024 * 1024:
+                            os.rename(log_file, log_file + ".old")
+                            
+                        with open(log_file, "a") as f:
                             f.write(json.dumps(telemetry) + "\n")
                     except Exception as e:
                         log.error("Failed to write telemetry: %s", e)
@@ -1231,6 +1245,7 @@ def _write_dotenv() -> None:
         "TELEGRAM_BOT_TOKEN",
         *[f"NVIDIA_NIM_KEY_{i}" for i in range(1, 7)],
         "HONCHO_API_KEY",
+        "PROXY_API_KEY",
         "RESEND_API_KEY",
         "EMAIL_ADDRESS", "EMAIL_PASSWORD",
         "EMAIL_IMAP_HOST", "EMAIL_IMAP_PORT",
