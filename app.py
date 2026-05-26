@@ -1074,13 +1074,21 @@ async def proxy(path: str, request: Request):
             async def _stream(response):
                 ttfb = None
                 full_response = []
+                stripped_text = ""
+                think_pattern = re.compile(r'<think>.*?</think>|<reasoning>.*?</reasoning>', re.DOTALL)
                 try:
                     async for chunk in response.aiter_bytes():
                         if chunk:
                             if ttfb is None:
                                 ttfb = time.time() - req_start_time
                             full_response.append(chunk)
-                            yield chunk
+                            # Strip thinking/reasoning markers from accumulated text
+                            raw = b"".join(full_response).decode('utf-8', errors='ignore')
+                            cleaned = think_pattern.sub('', raw)
+                            delta = cleaned[len(stripped_text):]
+                            if delta:
+                                stripped_text = cleaned
+                                yield delta.encode('utf-8')
                 except httpx.RequestError:
                     log.warning("PROXY upstream dropped mid-stream (connection error)")
                 finally:
@@ -1089,7 +1097,7 @@ async def proxy(path: str, request: Request):
                     
                     # --- TELEMETRY LOGGING ---
                     try:
-                        raw_resp = b"".join(full_response).decode('utf-8', errors='ignore')
+                        raw_resp = think_pattern.sub('', b"".join(full_response).decode('utf-8', errors='ignore'))
                         prompt_tokens = 0
                         completion_tokens = 0
                         
@@ -1140,10 +1148,19 @@ async def proxy(path: str, request: Request):
             last_resp = None
 
             async def _stream_last(response):
+                buf = []
+                stripped = ""
+                think_pattern = re.compile(r'<think>.*?</think>|<reasoning>.*?</reasoning>', re.DOTALL)
                 try:
                     async for chunk in response.aiter_bytes():
                         if chunk:
-                            yield chunk
+                            buf.append(chunk)
+                            raw = b"".join(buf).decode('utf-8', errors='ignore')
+                            cleaned = think_pattern.sub('', raw)
+                            delta = cleaned[len(stripped):]
+                            if delta:
+                                stripped = cleaned
+                                yield delta.encode('utf-8')
                 except httpx.RequestError:
                     pass
                 finally:
@@ -1300,6 +1317,10 @@ def _init_config() -> None:
                     cfg.setdefault("platforms", {}).setdefault("telegram", {}).setdefault("extra", {}).update(
                         src_cfg["telegram"]["extra"]
                     )
+
+            # Propagate display settings from source config (thinking/text suppression)
+            if "display" in src_cfg:
+                cfg["display"] = src_cfg["display"]
                 
         cfg.setdefault("network", {})["force_ipv4"] = True
         cfg.setdefault("agent",   {})["gateway_timeout"] = 1800

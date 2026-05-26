@@ -22,6 +22,14 @@ security:
 terminal:
   backend: local
 
+display:
+  show_reasoning: false
+  tool_progress: off
+  platforms:
+    telegram:
+      tool_progress: new
+      show_reasoning: false
+
 telegram:
   allowed_chats: '6557201395'
   allow_from: '6557201395'
